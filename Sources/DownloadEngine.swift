@@ -193,7 +193,7 @@ final class DownloadEngine {
                 throw DownloadError.badResponse
             }
             try fm.moveItem(at: tmp, to: outURL)
-            let size = (try? fm.attributesOfItem(atPath: outURL.path)[.size] as? Int64) ?? 0
+            let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
             await accumulator.finish(downloaded: size)
             try? fm.removeItem(at: tempDir)
             return outURL
