@@ -157,6 +157,11 @@ private final class SlicePool: @unchecked Sendable {
         lock.lock(); failures += 1; lock.unlock()
     }
 
+    func failureCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return failures
+    }
+
     func recordThrottle() {
         lock.lock(); throttles += 1; lock.unlock()
     }
@@ -307,18 +312,23 @@ private final class ChannelsBox: @unchecked Sendable {
 }
 
 /// 一个通道：独立 URLSession（独立连接池）+ 地址列表 + 实时吞吐
+///
+/// `urls` 不可变：`urls[0]` 是主地址，`urls.last` 是兜底（直连）。
+/// 多 lane 共享同一个 channel，旧的 `rotate()` 会全局变异 `urls`，
+/// 并发重试时 A 切到直连、B 又切回去，兜底形同虚设。
+/// 现在重试只用局部下标选地址，不再变异共享状态。
 private final class RouteChannel: @unchecked Sendable {
     let session: URLSession
     /// 展示名（直连 / gh-proxy.com / …），用于诊断面板
     let name: String
     private let lock = NSLock()
-    private var urls: [URL]
+    let urls: [URL]
     private var speed: Double
     private var _throttled = false
 
     init(session: URLSession, urls: [URL], speedHint: Double, name: String) {
         self.session = session
-        self.urls = urls
+        self.urls = urls.isEmpty ? [] : urls
         self.speed = max(speedHint, 1)
         self.name = name
     }
@@ -334,8 +344,17 @@ private final class RouteChannel: @unchecked Sendable {
     }
 
     var current: URL {
-        lock.lock(); defer { lock.unlock() }
-        return urls[0]
+        urls[0]
+    }
+
+    /// 主地址（`urls[0]`）
+    var primary: URL { urls[0] }
+    /// 兜底地址（直连）；单地址通道时与主地址相同
+    var fallback: URL { urls.last ?? urls[0] }
+
+    /// 该 URL 是否走了兜底（主备不同且命中了最后一个）
+    func isFallback(_ url: URL) -> Bool {
+        urls.count > 1 && url == urls.last && url != urls[0]
     }
 
     var measuredSpeed: Double {
@@ -345,12 +364,6 @@ private final class RouteChannel: @unchecked Sendable {
 
     func demote() {
         lock.lock(); speed = max(speed * 0.5, 1); lock.unlock()
-    }
-
-    func rotate() {
-        lock.lock()
-        if urls.count > 1 { urls = Array(urls.dropFirst()) + [urls[0]] }
-        lock.unlock()
     }
 
     func observe(elapsed: TimeInterval, bytes: Int64) {
@@ -767,9 +780,11 @@ final class DownloadEngine: @unchecked Sendable {
 
                     active.increment()
                     assigned = true
+                    let capturedChannels = channels
                     group.addTask { [self] in
                         await runSlice(laneId: laneId,
                                        channel: channel,
+                                       channels: capturedChannels,
                                        initial: work,
                                        pool: pool,
                                        lanes: lanes,
@@ -817,8 +832,10 @@ final class DownloadEngine: @unchecked Sendable {
     // MARK: - 一个 worker 的生命周期
 
     /// 攥着一段区间，一小片一小片地取数据；取完就要新活儿，绝不空转。
+    /// 重试走跨通道（首轮初始线、后续换线、末轮直连兜底），成功按实际通道归因。
     private func runSlice(laneId: Int,
                           channel: RouteChannel,
+                          channels: [RouteChannel],
                           initial: Chunk,
                           pool: SlicePool,
                           lanes: Int,
@@ -868,23 +885,24 @@ final class DownloadEngine: @unchecked Sendable {
             board.activeUrl = channel.current.absoluteString
 
             do {
-                let outcome = try await fetchSlice(chunk: Chunk(start: from, end: to),
-                                                   pool: pool,
-                                                   board: board,
-                                                   laneId: laneId,
-                                                   channel: channel)
+                let (outcome, winner, finalURL) = try await fetchSlice(chunk: Chunk(start: from, end: to),
+                                                                       pool: pool,
+                                                                       board: board,
+                                                                       laneId: laneId,
+                                                                       channel: channel,
+                                                                       channels: channels)
                 if !outcome.data.isEmpty {
                     sink.write(outcome.data, at: from)
                     pool.recordDone(Int64(outcome.data.count))
                     await accumulator.advance(Int64(outcome.data.count))
-                    channel.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
+                    winner.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
                     board.bumpDoneSlice()
-                    board.reward(channel.name)
+                    board.reward(winner.name)
 
                     let seconds = max(outcome.elapsed, 0.001)
                     board.update(LaneSnapshot(laneId: laneId,
-                                              routeName: channel.name,
-                                              url: channel.current.absoluteString,
+                                              routeName: winner.name,
+                                              url: finalURL.absoluteString,
                                               start: from,
                                               end: to,
                                               downloaded: Int64(outcome.data.count),
@@ -902,7 +920,10 @@ final class DownloadEngine: @unchecked Sendable {
                 if isCancelled || Task.isCancelled { return }
                 if (error as? DownloadError) == .cancelled { return }
 
-                // 这一片彻底失败（重试耗尽）：在面板上标红
+                // 这一片重试耗尽（已跨通道试过）：在面板上标红，还回池子。
+                // WriteSink.failed 只给磁盘写失败用：网络失败就标记的话，
+                // 后面所有 worker 写的数据都会被静默丢弃（upstream 的教训）。
+                // 失败预算耗尽才标记，调度循环的 90s 无进展保护也会兜底。
                 board.update(LaneSnapshot(laneId: laneId,
                                           routeName: channel.name,
                                           url: channel.current.absoluteString,
@@ -915,18 +936,16 @@ final class DownloadEngine: @unchecked Sendable {
                                           lastStatus: { if case let .throttled(code, _) = (error as? DownloadError) { return code }; return nil }()))
                 // 失败的那一段必须还回池子，否则文件会缺一块
                 pool.putBack(Chunk(start: from, end: to))
-
-                // 注意不要 markFailed：那是给「磁盘写失败」用的，
-                // 网络重试耗尽只是这一片失败 —— 写盘要是被标记 failed，
-                // 后面所有 worker 写的数据都会被静默丢弃，文件直接损坏。
-                // 让位退出即可，调度器会派新 worker 继续吃池子里的区间。
+                if pool.failureCount() > Self.maxSliceFailures(lanes: lanes) {
+                    sink.markFailed()
+                }
                 return
             }
 
             // 这一小片已经干完，回池子重新要活儿。
             //
             // 注意这里传的 live = 1：代表「我自己还占着一条连接」。
-            // 老实现传的是 0，而 splitTail 里 `if live <= 0 { return nil }`，
+            // 老实现传的是 0，而 splitTail 里 `if live <= 0 { return null }`，
             // 于是 worker 自己续做时**永远切不动尾部区间** —— 收尾阶段
             // 池子一空，所有 worker 就只能干等，退化成单连接爬完最后一段。
             guard let next = nextWork(pool: pool, live: 1, lanes: lanes, total: total) else { return }
@@ -954,20 +973,30 @@ final class DownloadEngine: @unchecked Sendable {
         return Int(min(max(share, Self.minSliceTarget), Self.maxSliceTarget))
     }
 
-    /// 按实时吞吐挑通道：快的多干活
+    /// 按实时吞吐加权挑通道：快的多干活，慢的也有活（带宽叠加）。
+    ///
+    /// 老实现是贪心取最快，导致所有 lane 挤在同一条通道/同一 session，
+    /// 既打爆单镜像（429/503）又浪费其它通道带宽，还让多 session 形同虚设。
+    /// 上游重写时退回了贪心，这里恢复加权（与安卓端一致）。
     private func pickChannel(_ channels: [RouteChannel], roundRobin: Int) -> Int {
         guard channels.count > 1 else { return 0 }
-        var best = roundRobin % channels.count
-        var bestSpeed = -1.0
-        for offset in channels.indices {
-            let index = (roundRobin + offset) % channels.count
-            let speed = channels[index].measuredSpeed
-            if speed > bestSpeed {
-                bestSpeed = speed
-                best = index
-            }
+        var total: Double = 0
+        var weights: [Double] = []
+        weights.reserveCapacity(channels.count)
+        for ch in channels {
+            var w = max(ch.measuredSpeed, 1)
+            // 被限流的通道降权 90%，而不是直接剔除（保底不断流）
+            if ch.throttled { w *= 0.1 }
+            weights.append(w)
+            total += w
         }
-        return best
+        guard total > 0 else { return roundRobin % channels.count }
+        var r = Double.random(in: 0..<total)
+        for (i, w) in weights.enumerated() {
+            r -= w
+            if r <= 0 { return i }
+        }
+        return weights.indices.max(by: { weights[$0] < weights[$1] }) ?? 0
     }
 
     // MARK: - 取一小片
@@ -977,12 +1006,21 @@ final class DownloadEngine: @unchecked Sendable {
     /// 失败时按指数退避重试；命中 429/503 时读 `Retry-After` 退避 ——
     /// Azure 单 Blob 有「约 60 MiB/s 或 500 请求/秒」的目标，超了就是 503 ServerBusy，
     /// 官方建议用指数退避而不是硬顶，否则会被越限越死。
+    ///
+    /// 多线路重试语义（本次修复的核心）：
+    ///  - attempt 0 用初始通道主地址；
+    ///  - attempt 1 起重新加权选通道（避开刚失败的那条），试另一条线的 primary；
+    ///  - 最后一次强制走直连兜底。
+    /// 全程只用局部变量选地址，不再变异共享 `RouteChannel`，并发重试互不踩。
+    /// 返回成功时的实际通道，调用方按它做 `observe/reward`，限流标记不张冠李戴。
     private func fetchSlice(chunk: Chunk,
                             pool: SlicePool,
                             board: LaneBoard,
                             laneId: Int,
-                            channel: RouteChannel) async throws -> SliceOutcome {
+                            channel: RouteChannel,
+                            channels: [RouteChannel]) async throws -> (SliceOutcome, RouteChannel, URL) {
         var lastError: Error = DownloadError.badResponse
+        let direct = channels.first(where: { $0.name == DownloadRoute.direct.name })
         // 限流撞了两回就直接放弃这一片：继续退避 = 攥着区间干等，
         // 整条下载都陪着这条被限流的通道停摆。让位给调度器重新派。
         var throttledCount = 0
@@ -992,39 +1030,63 @@ final class DownloadEngine: @unchecked Sendable {
             try Task.checkCancellation()
             if isCancelled || inflight.isCancelling { throw DownloadError.cancelled }
 
-            var request = URLRequest(url: channel.current)
+            // 选本轮实际通道：首轮用初始，后续换线，最后兜底直连
+            let active: RouteChannel
+            let targetURL: URL
+            if attempt == 0 || channels.count <= 1 {
+                active = channel
+                targetURL = active.primary
+            } else if attempt >= Self.maxAttempts - 1 {
+                if let direct {
+                    active = direct
+                    targetURL = direct.primary
+                } else {
+                    // plan 里没有直连（如直连测速太慢被剔除）：用该通道自带的兜底（即直连 URL）。
+                    // 此时成功不代表镜像恢复，见下面 `isFallback` 分支。
+                    active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name)]
+                    targetURL = active.fallback
+                }
+            } else {
+                active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name)]
+                targetURL = active.primary
+            }
+            // 兜底地址即直连：成功不清除镜像的限流标记，归因清晰。
+            let isFallbackURL = targetURL != active.primary
+
+            var request = URLRequest(url: targetURL)
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("bytes=\(chunk.start)-\(chunk.end)", forHTTPHeaderField: "Range")
             request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
 
             let startedAt = Date()
             do {
-                let (data, response) = try await send(request, on: channel.session)
+                let (data, response) = try await send(request, on: active.session)
                 guard let http = response as? HTTPURLResponse else { throw DownloadError.badResponse }
 
                 switch http.statusCode {
                 case 206:
-                    channel.setThrottled(false)
+                    // 兜底（直连）成功不代表镜像恢复，不清除镜像限流标记
+                    if !isFallbackURL { active.setThrottled(false) }
                     guard !data.isEmpty else { throw DownloadError.incomplete }
-                    return SliceOutcome(data: data, elapsed: Date().timeIntervalSince(startedAt))
+                    return (SliceOutcome(data: data, elapsed: Date().timeIntervalSince(startedAt)), active, targetURL)
                 case 200:
                     // 服务器忽略了 Range（回 200 全量）。这多半意味着这条地址
-                    // 不支持分段：交给重试逻辑换备用地址。
+                    // 不支持分段：交给重试逻辑换条线（下轮自动选别的通道）。
                     // 唯一能救的是 start==0 的片 —— 数据本来就是从 0 开始的，
                     // 截取前 want 字节照样是对的（URLSession 已把整个响应读进来，
                     // prefix 只是截取引用段，不会二次拷贝整个文件）。
                     guard chunk.start == 0 else { throw DownloadError.noRangeSupport }
-                    channel.setThrottled(false)
+                    if !isFallbackURL { active.setThrottled(false) }
                     let head = data.prefix(Int(chunk.length))
                     guard head.count > 0 else { throw DownloadError.incomplete }
-                    return SliceOutcome(data: Data(head), elapsed: Date().timeIntervalSince(startedAt))
+                    return (SliceOutcome(data: Data(head), elapsed: Date().timeIntervalSince(startedAt)), active, targetURL)
                 case 429, 503:
                     pool.recordThrottle()
                     board.bumpThrottle()
                     // 通道级降额：不是简单降权重，而是直接把它判为「被限流」，
                     // 调度器下一轮就会削它的并发，避免越限越死。
-                    channel.setThrottled(true)
-                    board.penalize(channel.name)
+                    active.setThrottled(true)
+                    board.penalize(active.name)
                     throw DownloadError.throttled(code: http.statusCode,
                                                   retryAfter: Self.retryAfter(http))
                 default:
@@ -1041,16 +1103,16 @@ final class DownloadEngine: @unchecked Sendable {
                 board.bumpRetry()
                 if attempt >= Self.maxAttempts - 1 { break }
 
-                // 不支持 Range 的地址：换下一个立刻重试，不退避 —— 这是地址选错了，
-                // 不是服务器忙（attempt 照常消耗，单地址轮到自己时也能正常退出）
+                // 不支持 Range 的地址：下轮循环自动换线重试，不退避 —— 这是地址选错了，
+                // 不是服务器忙（attempt 照常消耗，单地址轮到自己时也能正常退出）。
+                // endpoints 不可变，不再原地轮换，换线由选路负责。
                 if (error as? DownloadError) == .noRangeSupport {
-                    channel.rotate()
                     continue
                 }
 
                 if case .throttled(_, _) = (error as? DownloadError) {
                     // 被限流：把这条通道的权重降下来，让活儿分给别人
-                    channel.demote()
+                    active.demote()
                     throttledCount += 1
                     if throttledCount >= 2 {
                         // 连着两次限流：这条通道眼下进不去，别攥着区间长睡，
@@ -1059,12 +1121,11 @@ final class DownloadEngine: @unchecked Sendable {
                         throw error
                     }
                 }
-                if attempt >= 1 { channel.rotate() }
 
                 // 重试状态同步到面板：用户能看到「车道 #3 正在第 2 次重试 / 上一次 503」
                 board.update(LaneSnapshot(laneId: laneId,
-                                          routeName: channel.name,
-                                          url: channel.current.absoluteString,
+                                          routeName: active.name,
+                                          url: targetURL.absoluteString,
                                           start: chunk.start,
                                           end: chunk.end,
                                           downloaded: 0,
@@ -1080,6 +1141,56 @@ final class DownloadEngine: @unchecked Sendable {
 
         pool.recordFailure()
         throw lastError
+    }
+
+    /// 重试选路：加权随机，但排除刚失败的那条线（单通道时无处可避，直接返回 0）。
+    ///
+    /// 排除是为了“首失败即换线”：一直加权随机仍可能连抽同一条坏线，
+    /// 白白浪费 `maxAttempts` 里宝贵的第二次机会。
+    private static func pickRetryIndex(channels: [RouteChannel], excluding name: String) -> Int {
+        guard channels.count > 1 else { return 0 }
+        var total: Double = 0
+        var weights: [Double] = []
+        weights.reserveCapacity(channels.count)
+        for ch in channels {
+            if ch.name == name {
+                weights.append(0)
+                continue
+            }
+            var w = max(ch.measuredSpeed, 1)
+            if ch.throttled { w *= 0.1 }
+            weights.append(w)
+            total += w
+        }
+        // 被排除后无可用（同名通道占满，比如单通道复用）：退回普通加权
+        if total <= 0 {
+            return DownloadEngine.pickWeightedIndex(channels: channels.map { ($0.measuredSpeed, $0.throttled) })
+        }
+        var r = Double.random(in: 0..<total)
+        for (i, w) in weights.enumerated() {
+            r -= w
+            if r <= 0 { return i }
+        }
+        return weights.indices.max(by: { weights[$0] < weights[$1] }) ?? 0
+    }
+
+    /// 纯权重抽样（无排除），供重试回退路径复用，避免实例方法在 static 上下文里不可用。
+    private static func pickWeightedIndex(channels: [(speed: Double, throttled: Bool)]) -> Int {
+        var total: Double = 0
+        var weights: [Double] = []
+        for ch in channels {
+            var w = max(ch.speed, 1)
+            if ch.throttled { w *= 0.1 }
+            weights.append(w)
+            total += w
+        }
+        guard total > 0 else { return 0 }
+        var r = Double.random(in: 0..<total)
+        for (i, w) in weights.enumerated() {
+            r -= w
+            if r <= 0 { return i }
+        }
+        return 0
     }
 
     // MARK: - 单连接下载（不支持分段 / 探测不到体积时）
@@ -1212,6 +1323,14 @@ final class DownloadEngine: @unchecked Sendable {
     private static let singleProbeBytes: Int64 = 64 * 1024
     private static let maxAttempts = 3
     private static let userAgent = "ArtifactBoost"
+
+    /// 单片耗尽重试（已跨通道）后不立刻毒化整文件，攒够这么多才判死。
+    /// 取 `max(20, lanes*2)`：flaky 网络下零星失败能被别的 lane 捡回重下，
+    /// 签名过期/全线 400 时又能较快收敛去走 Manager 层的直连回退，而不是空转。
+    /// （常驻 worker 失败时让位退出，无进展保护 90s 也会兜底，双保险。）
+    fileprivate static func maxSliceFailures(lanes: Int) -> Int {
+        max(20, lanes * 2)
+    }
 
     /// 引擎并发上限（与 AccelerationSettings.maxConnections 一致）
     private static let maxLanes = 128
