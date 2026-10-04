@@ -1,25 +1,19 @@
 import SwiftUI
 import UIKit
 
-/// 设置：账户 + 加速设置（并发 / 通道）+ 通道测速 + 关于
+/// 设置：账户 + 加速设置（并发）+ 下载源 + 关于
 struct SettingsView: View {
     @EnvironmentObject private var session: SessionManager
-    @EnvironmentObject private var downloads: DownloadManager
 
     @State private var settings = AccelerationSettings.load()
     // 原神彩蛋：长按导航栏「设置」标题触发，二次确认后才跳官网，不做后台静默下载
     @State private var showGenshinEgg = false
-    @State private var isTesting = false
-    @State private var testResults: [ScoredRoute] = []
-    @State private var testTargetLabel: String?
-    @State private var testMessage: String?
-    @State private var testFailed = false
 
     var body: some View {
         List {
             accountSection
             accelerationSection
-            speedTestSection
+            sourceSection
             aboutSection
         }
         .listStyle(.insetGrouped)
@@ -40,7 +34,6 @@ struct SettingsView: View {
         }
         .genshinEasterEggAlert(isPresented: $showGenshinEgg)
         .onAppear {
-            // 下载过程中可能自动记录过测速结果，回到设置页时同步一下
             settings = AccelerationSettings.load()
         }
     }
@@ -95,112 +88,67 @@ struct SettingsView: View {
                 }
             }
             .pickerStyle(.segmented)
+        } header: {
+            Text("加速设置")
+        } footer: {
+            Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。")
+        }
+    }
 
-            Picker("下载通道", selection: modeBinding) {
-                ForEach(RouteMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
+    // MARK: - 下载源
+
+    private var sourceSection: some View {
+        Section {
+            HStack(spacing: 10) {
+                SourceButton(title: "官方源",
+                             subtitle: "直连 GitHub",
+                             systemImage: "cloud.fill",
+                             selected: settings.mode == .direct,
+                             accent: Theme.accent) {
+                    settings.mode = .direct
+                    settings.save()
+                }
+                SourceButton(title: "镜像加速",
+                             subtitle: "多通道并行 · 推荐",
+                             systemImage: "bolt.fill",
+                             selected: settings.mode == .smart,
+                             accent: Theme.green) {
+                    settings.mode = .smart
+                    settings.save()
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.vertical, 2)
+
+            Toggle(isOn: customBinding) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自建中转")
+                    Text("用自己的反代地址下载")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
 
             if settings.mode == .custom {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("加速前缀")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    TextField("https://你的中转地址/", text: prefixBinding)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .padding(10)
-                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+                TextField("https://你的中转地址/", text: prefixBinding)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                if DownloadRoute.normalizedPrefix(settings.customPrefix).isEmpty {
+                    Text("前缀为空时将回退直连")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.orange)
                 }
             }
         } header: {
-            Text("加速设置")
+            Text("下载源")
         } footer: {
             VStack(alignment: .leading, spacing: 6) {
                 Text(settings.mode.detail)
-                Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。")
                 if settings.mode == .smart {
                     Text("智能加速会额外尝试 ghfast.top —— 它只认 github.com 原始地址，因此**仅对发行版（Release）附件生效**，构建产物与日志仍走其它镜像。")
                 }
             }
-        }
-    }
-
-    // MARK: - 测速
-
-    private var speedTestSection: some View {
-        Section {
-            Button {
-                Task { await runSpeedTest() }
-            } label: {
-                HStack {
-                    Label("测速并保存最快通道", systemImage: "bolt.horizontal.circle.fill")
-                    Spacer()
-                    if isTesting {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-            }
-            .disabled(isTesting)
-
-            if let route = settings.testedRoute, let date = settings.testedAt {
-                HStack(spacing: 10) {
-                    IconBadge(systemName: route.isDirect ? "arrow.right" : "cloud.fill",
-                              color: route.isDirect ? Theme.orange : Theme.green,
-                              size: 32)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(route.isDirect ? "直连" : route.name)
-                            .font(.subheadline.weight(.semibold))
-                        Text("已保存 · \(formatSpeed(settings.testedSpeed)) · \(date.formatted(date: .numeric, time: .shortened))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    StatusPill(text: "当前使用", color: Theme.green)
-                }
-                .padding(.vertical, 2)
-            }
-
-            if !testResults.isEmpty {
-                ForEach(testResults, id: \.route) { result in
-                    HStack(spacing: 10) {
-                        IconBadge(systemName: result.route.isDirect ? "arrow.right" : "cloud.fill",
-                                  color: result.route.isDirect ? Theme.orange : Theme.accent,
-                                  size: 30)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(result.route.isDirect ? "直连" : result.route.name)
-                                .font(.caption.weight(.semibold))
-                            if let label = testTargetLabel {
-                                Text(label)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                            }
-                        }
-                        Spacer()
-                        Text(formatSpeed(result.speed))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(result == testResults.first ? Theme.green : .secondary)
-                    }
-                }
-            }
-
-            if let testMessage {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: testFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                        .foregroundStyle(testFailed ? Theme.orange : Theme.green)
-                    Text(testMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        } header: {
-            Text("通道测速")
-        } footer: {
-            Text("测速会拿一个真实的下载目标（优先用你自己仓库里最新的构建产物）分别测试每条通道，把最快的保存下来。之后所有下载都直接用它，不用每次现测。")
         }
     }
 
@@ -226,60 +174,51 @@ struct SettingsView: View {
                 set: { settings.connections = $0; settings.save() })
     }
 
-    private var modeBinding: Binding<RouteMode> {
-        Binding(get: { settings.mode },
-                set: {
-                    settings.mode = $0
-                    settings.save()
-                    testResults = []
-                    testMessage = nil
-                })
-    }
-
     private var prefixBinding: Binding<String> {
         Binding(get: { settings.customPrefix },
                 set: { settings.customPrefix = $0; settings.save() })
     }
 
-    // MARK: - 测速实现
+    /// 自建中转开关：打开进自定义，关闭回到镜像加速
+    private var customBinding: Binding<Bool> {
+        Binding(get: { settings.mode == .custom },
+                set: {
+                    settings.mode = $0 ? .custom : .smart
+                    settings.save()
+                })
+    }
+}
 
-    private func runSpeedTest() async {
-        isTesting = true
-        testResults = []
-        testMessage = nil
-        testFailed = false
-        settings.save()
-        defer { isTesting = false }
+/// 下载源大按钮：选中时按语义色高亮，未选中时灰边。复用给官方源 / 镜像加速。
+private struct SourceButton: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let selected: Bool
+    let accent: Color
+    let action: () -> Void
 
-        guard let target = await downloads.findTestTarget() else {
-            testFailed = true
-            testMessage = "没找到可用的测速对象：至少需要一个跑过 Actions 的仓库（有产物或日志）。"
-            return
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 22))
+                    .foregroundStyle(selected ? accent : .secondary)
+                Text(title)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(selected ? accent : .primary)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(selected ? accent.opacity(0.12) : Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
+                    .stroke(selected ? accent : Color(.separator), lineWidth: selected ? 1.5 : 1)
+            }
         }
-
-        testTargetLabel = target.label
-        var candidates = settings.candidateRoutes(isPrivateRepo: target.isPrivate)
-        if target.isPrivate {
-            candidates = [.direct]
-        }
-
-        let measured = await RouteProbe.measureAll(among: candidates, signedURL: target.url, knownSize: target.size)
-        testResults = measured
-
-        guard let best = measured.first else {
-            testFailed = true
-            testMessage = "测速失败：所有通道都没取到数据，请检查网络后重试。"
-            return
-        }
-
-        settings.record(route: best.route, speed: best.speed)
-        var text = "已保存：\(best.route.isDirect ? "直连" : best.route.name) · \(formatSpeed(best.speed))"
-        if target.isPrivate {
-            text += "（测速对象来自私有仓库，只测了直连，不会把地址交给镜像）"
-        }
-        if measured.count < candidates.count {
-            text += "（部分通道超时已跳过）"
-        }
-        testMessage = text
     }
 }

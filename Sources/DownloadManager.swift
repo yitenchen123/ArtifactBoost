@@ -1,15 +1,6 @@
 import Foundation
 import UIKit
 
-/// 测速用的真实目标（优先产物，其次构建日志）
-struct SpeedTestTarget: Sendable {
-    let url: URL
-    let label: String
-    let isPrivate: Bool
-    /// 已知体积：测速时从文件中部取样，避开 TCP 慢启动
-    var size: Int64? = nil
-}
-
 @MainActor
 final class DownloadManager: ObservableObject {
     enum State: Equatable {
@@ -29,6 +20,9 @@ final class DownloadManager: ObservableObject {
     private var engines: [String: DownloadEngine] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var backgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
+
+    /// 未完成任务的落盘：进程被杀后靠它自动续下
+    private let taskStore = DownloadTaskStore()
 
     let session: SessionManager
 
@@ -71,6 +65,8 @@ final class DownloadManager: ObservableObject {
         items[item.id] = item
         states[item.id] = .resolving
         routeSummary[item.id] = nil
+        // 先落盘再开工：中途进程被杀，下次启动能按这份记录续下
+        taskStore.save(TaskRecord(item: item, settings: settings))
 
         let engine = DownloadEngine()
         engines[item.id] = engine
@@ -97,11 +93,15 @@ final class DownloadManager: ObservableObject {
                                                     settings: settings,
                                                     onProgress: onProgress)
                 states[item.id] = .finished(url)
+                // 下完了：清掉落盘记录，避免重启后复活
+                taskStore.remove(id: item.id)
             } catch {
                 if Self.isCancellation(error) {
                     states[item.id] = .idle
                 } else {
                     states[item.id] = .failed(error.localizedDescription)
+                    // 失败不自动续下：清记录，用户手动重试时会重新落盘
+                    taskStore.remove(id: item.id)
                 }
             }
             engines[item.id] = nil
@@ -122,6 +122,8 @@ final class DownloadManager: ObservableObject {
         tasks[item.id] = nil
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
+        // 用户主动取消：清记录，不恢复
+        taskStore.remove(id: item.id)
         states[item.id] = .idle
     }
 
@@ -131,6 +133,7 @@ final class DownloadManager: ObservableObject {
         tasks[item.id] = nil
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
+        taskStore.remove(id: item.id)
         states[item.id] = nil
         routeSummary[item.id] = nil
         items[item.id] = nil
@@ -149,44 +152,20 @@ final class DownloadManager: ObservableObject {
         }
     }
 
-    /// 设置页测速用：在用户自己的仓库里找一个真实的下载目标
+    /// 后台恢复：进程重启后把上次没下完的任务自动续上。
     ///
-    /// 找目标限时 20s（与安卓端同步）：内部是串行网络请求
-    /// （仓库→构建→产物→签名地址），而 API 请求走 `URLSession.shared`
-    /// （默认 60s 请求超时），整体不限时会让设置页转圈一分钟以上。
-    /// 超时返回 nil，调用方按“无可用目标”提示。
-    static let findTestTargetTimeout: TimeInterval = 20
-
-    func findTestTarget() async -> SpeedTestTarget? {
-        guard let client = session.client else { return nil }
-        switch await withTimeout(seconds: Self.findTestTargetTimeout,
-                                 operation: { [client] in await Self.findTestTargetUnsafe(client: client) }) {
-        case .completed(let target): return target
-        case .timedOut: return nil
+    /// 必须在登录态恢复之后调（无 client 时直接返回，记录保留待下次启动）。
+    /// 签名地址有时效，恢复即重新解析，不沿用死时的旧地址。
+    ///
+    /// - Returns: 实际重新入队的任务数。
+    @discardableResult
+    func restorePending() -> Int {
+        let records = taskStore.loadAll()
+        guard !records.isEmpty, session.client != nil else { return 0 }
+        for record in records {
+            start(record.item, settings: record.settings)
         }
-    }
-
-    private static func findTestTargetUnsafe(client: GitHubClient) async -> SpeedTestTarget? {
-        guard let repos = try? await client.repos(page: 1) else { return nil }
-        // 公开仓库优先：私有仓库的签名地址不应该交给镜像去测速
-        let ordered = repos.sorted { ($0.isPrivate ? 1 : 0, $0.name) < ($1.isPrivate ? 1 : 0, $1.name) }
-        for repo in ordered.prefix(5) {
-            guard let runs = try? await client.workflowRuns(repo: repo), let run = runs.first else { continue }
-            let candidateArtifact = (try? await client.artifacts(repo: repo, run: run))?
-                .filter { !$0.expired }
-                .max { $0.sizeInBytes < $1.sizeInBytes }
-            if let artifact = candidateArtifact,
-               let url = try? await client.resolveDownloadURL(for: .artifact(repo: repo.fullName, id: artifact.id)) {
-                return SpeedTestTarget(url: url,
-                                       label: "\(repo.name) · \(artifact.name)",
-                                       isPrivate: repo.isPrivate,
-                                       size: artifact.sizeInBytes)
-            }
-            if let url = try? await client.resolveDownloadURL(for: .runLogs(repo: repo.fullName, runID: run.id)) {
-                return SpeedTestTarget(url: url, label: "\(repo.name) · 构建日志", isPrivate: repo.isPrivate)
-            }
-        }
-        return nil
+        return records.count
     }
 
     // MARK: - 下载主流程
@@ -213,7 +192,7 @@ final class DownloadManager: ObservableObject {
                     try await Task.sleep(nanoseconds: UInt64(Self.resolveRetryDelay * 1_000_000_000))
                 }
                 let signed = try await Self.resolveWithTimeout(client: client, source: item.source)
-                // 解析成功：清掉可能存在的“重试…”文案，后面测速/下载会刷自己的说明
+                // 解析成功：清掉可能存在的“重试…”文案，后面下载会刷自己的说明
                 routeSummary[item.id] = nil
                 return try await run(item: item,
                                      engine: engine,
@@ -253,44 +232,13 @@ final class DownloadManager: ObservableObject {
         // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedURL。
         let githubURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
 
-        var plan: [ScoredRoute]
-        var note: String
-
-        if let saved = settings.savedPlan(isPrivateRepo: item.isPrivate, githubURL: githubURL) {
-            // 设置页已经测过速：直接用保存的最快通道
-            plan = saved
-            note = "\(saved[0].route.name)（设置页测速 \(formatSpeed(saved[0].speed))）"
-        } else {
-            let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: githubURL)
-            if candidates.count <= 1 {
-                plan = [ScoredRoute(route: candidates[0], speed: 1)]
-                note = (item.isPrivate && settings.mode == .smart) ? "直连（私有仓库不走镜像）" : candidates[0].name
-            } else {
-                routeSummary[item.id] = "正在测速选通道…"
-                let measured = await RouteProbe.measureAll(among: candidates,
-                                                           signedURL: signedURL,
-                                                           githubURL: githubURL,
-                                                           sampleLimit: item.size ?? RouteProbe.sampleBytes,
-                                                           knownSize: item.size)
-                let fastest = measured.first?.speed ?? 0
-                let viable = measured.filter { $0.speed >= fastest * 0.4 }
-                if viable.isEmpty {
-                    plan = [ScoredRoute(route: .direct, speed: 1)]
-                    note = "直连（测速失败）"
-                } else {
-                    plan = viable
-                    note = Self.describe(plan) + "（实测 \(formatSpeed(fastest))）"
-                    if settings.mode == .smart, let best = measured.first {
-                        // 顺手把结果存下来，下次下载和设置页都能直接复用。
-                        // 注意 record() 是 mutating：必须落在一个 var 上，
-                        // 否则「写了个临时副本又丢掉」，下次还会重新测速。
-                        // record() 内部已经 save() 了。
-                        var updated = settings
-                        updated.record(route: best.route, speed: best.speed)
-                    }
-                }
-            }
-        }
+        // 无测速：候选通道直接全部并行，初始权重均等，
+        // 引擎下载中按实时吞吐动态调整分配。
+        let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: githubURL)
+        let plan = candidates.map { ScoredRoute(route: $0, speed: 1) }
+        let note = (item.isPrivate && settings.mode == .smart)
+            ? "直连（私有仓库不走镜像）"
+            : Self.describe(plan)
 
         let connections = settings.clampedConnections
         // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址

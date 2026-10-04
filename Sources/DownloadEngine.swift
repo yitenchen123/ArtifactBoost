@@ -749,6 +749,10 @@ final class DownloadEngine: @unchecked Sendable {
 
                 // 1) 把并发顶到「当前允许值」；通道被限流时按配额收缩
                 var assigned = false
+                // 尾段只派快通道：剩的不够全员分时，再按权重抽中慢线，
+                // 整体完成时间就被最慢那一片 gate 住（与安卓端一致）。
+                let tailIsolated = Self.isTailRemaining(remaining: max(total - pool.downloaded(), 0),
+                                                        lanes: lanes)
                 while active.current < allowedLanes {
                     // 此刻实际可用的并发额度：被限流的通道要临时降额，
                     // 免得在同一根已经饱和的线路上继续加压、越限越死。
@@ -761,7 +765,7 @@ final class DownloadEngine: @unchecked Sendable {
                     if active.current >= quota { break }
 
                     guard let work = nextWork(pool: pool, live: active.current, lanes: lanes, total: total) else { break }
-                    let channelIndex = pickChannel(channels, roundRobin: roundRobin)
+                    let channelIndex = pickChannel(channels, roundRobin: roundRobin, excludeThrottled: tailIsolated)
                     let channel = channels[channelIndex]
                     roundRobin = (roundRobin + 1) % channels.count
 
@@ -808,9 +812,12 @@ final class DownloadEngine: @unchecked Sendable {
 
                 // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU。
                 // 这个分支每多睡一次，就是在「明明还能切分尾部、却白白空等」
-                // 的时间上加一笔，所以窗口收紧到 60ms。
+                // 的时间上加一笔；尾段小片几十 ms 就能跑完，窗口进一步收紧到 25ms
+                //（与安卓端一致，非尾段保持 60ms）。
                 if !assigned {
-                    try await Task.sleep(for: .milliseconds(60))
+                    let tail = Self.isTailRemaining(remaining: max(total - pool.downloaded(), 0),
+                                                    lanes: lanes)
+                    try await Task.sleep(for: .milliseconds(tail ? 25 : 60))
                 }
             }
             // 取消时把还在跑的子任务一起掐掉，别让它们继续占用连接
@@ -850,8 +857,11 @@ final class DownloadEngine: @unchecked Sendable {
             if Task.isCancelled { return }
 
             let remaining = max(total - pool.downloaded(), 0)
-            let want = max(1, min(sliceTarget(lanes: lanes, total: total, remaining: remaining),
-                                  Int(current.length)))
+            // 快通道按 BDP 取大片：摊薄每片一次 HTTP 往返的 RTT 税，尾段 QPS 也顺势降下来
+            //（与安卓端一致，慢通道与未测速时近似无操作）。
+            let want = Self.sliceWant(lanes: lanes, total: total, remaining: remaining,
+                                      currentLen: Int(current.length),
+                                      measuredSpeed: channel.measuredSpeed)
             let from = current.start
             let to = from + Int64(want) - 1
 
@@ -886,11 +896,13 @@ final class DownloadEngine: @unchecked Sendable {
 
             do {
                 let (outcome, winner, finalURL) = try await fetchSlice(chunk: Chunk(start: from, end: to),
-                                                                       pool: pool,
-                                                                       board: board,
-                                                                       laneId: laneId,
-                                                                       channel: channel,
-                                                                       channels: channels)
+                                                                        pool: pool,
+                                                                        board: board,
+                                                                        laneId: laneId,
+                                                                        channel: channel,
+                                                                        channels: channels,
+                                                                        tailIsolated: Self.isTailRemaining(remaining: remaining,
+                                                                                                           lanes: lanes))
                 if !outcome.data.isEmpty {
                     sink.write(outcome.data, at: from)
                     pool.recordDone(Int64(outcome.data.count))
@@ -973,24 +985,79 @@ final class DownloadEngine: @unchecked Sendable {
         return Int(min(max(share, Self.minSliceTarget), Self.maxSliceTarget))
     }
 
+    /// 是否进入「尾段」：剩余数据已经不够把所有 lane 按最小片喂饱。
+    ///
+    /// 这个点之后并行度必然坍缩（剩 1MB、lanes=64 时最多十几条有活干），
+    /// 策略必须从「带宽叠加」切换成「别让慢线拖尾」：只派给快通道、
+    /// 单片按 BDP 取大、慢片超时让位。阈值自适应 lanes，不用额外常数
+    ///（与安卓端 `isTailRemaining` 一致）。
+    private static func isTailRemaining(remaining: Int64, lanes: Int) -> Bool {
+        remaining < Int64(lanes) * minSliceTarget * 2
+    }
+
+    /// 单片按带宽时延积（BDP）保底：在快通道上别用 64KB 小片去交 RTT 税。
+    ///
+    /// 每片至少覆盖 `tailBdpSeconds` 秒的传输量（按该通道实测速度），
+    /// 否则 64KB 在 150ms RTT 下有效吞吐只有体感的 1/10，还顺手把 QPS
+    /// 打到 Azure/Cloudflare 的 429/503 线上。慢通道不受影响（floor 小），
+    /// 初始未测速时 measuredSpeed≈1 也近似无操作。调用方仍需以 currentLen 为上限
+    ///（与安卓端 `bdpFloorBytes` 一致）。
+    private static let tailBdpSeconds = 0.25
+
+    private static func bdpFloorBytes(measuredSpeed: Double) -> Int {
+        Int(min(max(measuredSpeed * tailBdpSeconds, 0), Double(maxSliceTarget)))
+    }
+
+    /// 结合剩余量与通道速度算出本片要多少字节（与安卓端 `sliceWant` 一致）。
+    private static func sliceWant(lanes: Int, total: Int64, remaining: Int64,
+                                  currentLen: Int, measuredSpeed: Double) -> Int {
+        let base = Int(min(max((max(remaining, 0) / Int64(lanes * 4)) * 2,
+                               minSliceTarget), maxSliceTarget))
+        let want = max(base, min(bdpFloorBytes(measuredSpeed: measuredSpeed), currentLen))
+        return min(max(want, 1), max(currentLen, 1))
+    }
+
+    /// 单片可接受的最低平均速度：低于它就不是慢、是卡住，直接超时让位
+    ///（与安卓端 `MIN_ACCEPTABLE_SLICE_SPEED` 一致）。
+    private static let minAcceptableSliceSpeed: Int64 = 50 * 1024
+
+    /// 单片总耗时上限（毫秒）：按最低可接受速度推导，另设 20s 下限兜住小片。
+    /// 64KB~1MB 片约 20s，4MB 片约 80s。命中后抛 `incomplete` 走既有重试换线，
+    /// 把区间让给快通道，而不是攥着尾段干等（与安卓端 `sliceTimeoutMs` 一致）。
+    private static func sliceTimeoutMs(length: Int64) -> Int64 {
+        max(20_000, length * 1_000 / minAcceptableSliceSpeed)
+    }
+
     /// 按实时吞吐加权挑通道：快的多干活，慢的也有活（带宽叠加）。
     ///
     /// 老实现是贪心取最快，导致所有 lane 挤在同一条通道/同一 session，
     /// 既打爆单镜像（429/503）又浪费其它通道带宽，还让多 session 形同虚设。
     /// 上游重写时退回了贪心，这里恢复加权（与安卓端一致）。
-    private func pickChannel(_ channels: [RouteChannel], roundRobin: Int) -> Int {
+    ///
+    /// - Parameter excludeThrottled: 尾段隔离：直接排除被限流通道（而不是只降权），
+    ///   剩的不够全员分时不再给慢线派尾片。全部被排除时退回普通加权保底不断流。
+    private func pickChannel(_ channels: [RouteChannel], roundRobin: Int,
+                             excludeThrottled: Bool = false) -> Int {
         guard channels.count > 1 else { return 0 }
         var total: Double = 0
         var weights: [Double] = []
         weights.reserveCapacity(channels.count)
         for ch in channels {
+            if excludeThrottled, ch.throttled {
+                weights.append(0)
+                continue
+            }
             var w = max(ch.measuredSpeed, 1)
             // 被限流的通道降权 90%，而不是直接剔除（保底不断流）
             if ch.throttled { w *= 0.1 }
             weights.append(w)
             total += w
         }
-        guard total > 0 else { return roundRobin % channels.count }
+        // 尾段隔离把全部通道都排除时：退回普通加权，保底不断流
+        if total <= 0 {
+            if excludeThrottled { return pickChannel(channels, roundRobin: roundRobin) }
+            return roundRobin % channels.count
+        }
         var r = Double.random(in: 0..<total)
         for (i, w) in weights.enumerated() {
             r -= w
@@ -1018,7 +1085,8 @@ final class DownloadEngine: @unchecked Sendable {
                             board: LaneBoard,
                             laneId: Int,
                             channel: RouteChannel,
-                            channels: [RouteChannel]) async throws -> (SliceOutcome, RouteChannel, URL) {
+                            channels: [RouteChannel],
+                            tailIsolated: Bool = false) async throws -> (SliceOutcome, RouteChannel, URL) {
         var lastError: Error = DownloadError.badResponse
         let direct = channels.first(where: { $0.name == DownloadRoute.direct.name })
         // 限流撞了两回就直接放弃这一片：继续退避 = 攥着区间干等，
@@ -1043,11 +1111,13 @@ final class DownloadEngine: @unchecked Sendable {
                 } else {
                     // plan 里没有直连（如直连测速太慢被剔除）：用该通道自带的兜底（即直连 URL）。
                     // 此时成功不代表镜像恢复，见下面 `isFallback` 分支。
-                    active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name)]
+                    active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name,
+                                                          excludeThrottled: tailIsolated)]
                     targetURL = active.fallback
                 }
             } else {
-                active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name)]
+                active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name,
+                                                      excludeThrottled: tailIsolated)]
                 targetURL = active.primary
             }
             // 兜底地址即直连：成功不清除镜像的限流标记，归因清晰。
@@ -1057,10 +1127,26 @@ final class DownloadEngine: @unchecked Sendable {
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("bytes=\(chunk.start)-\(chunk.end)", forHTTPHeaderField: "Range")
             request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            // 定稿后冻结：group 子任务闭包按值捕获，避免 `var` 捕获告警
+            let finishedRequest = request
 
             let startedAt = Date()
             do {
-                let (data, response) = try await send(request, on: active.session)
+                // 慢片超时：单片总耗时封顶，超时即放弃本片走换线重试，
+                // 把区间让给快通道 —— 尾段不再被一条卡住的连接 gate 住。
+                // 安卓端是在读循环里查 deadline；URLSession 整包返回，这里做成竞速超时，
+                // 超时胜出时抛出的 incomplete 会走既有重试换线，group 退出时顺带掐掉慢请求。
+                let timeoutMs = Self.sliceTimeoutMs(length: chunk.length)
+                let (data, response): (Data, URLResponse) = try await withThrowingTaskGroup(of: (Data, URLResponse).self) { grp in
+                    grp.addTask { [self] in try await self.send(finishedRequest, on: active.session) }
+                    grp.addTask {
+                        try await Task.sleep(for: .milliseconds(Int(timeoutMs)))
+                        throw DownloadError.incomplete
+                    }
+                    guard let first = try await grp.next() else { throw DownloadError.incomplete }
+                    grp.cancelAll()
+                    return first
+                }
                 guard let http = response as? HTTPURLResponse else { throw DownloadError.badResponse }
 
                 switch http.statusCode {
@@ -1147,13 +1233,20 @@ final class DownloadEngine: @unchecked Sendable {
     ///
     /// 排除是为了“首失败即换线”：一直加权随机仍可能连抽同一条坏线，
     /// 白白浪费 `maxAttempts` 里宝贵的第二次机会。
-    private static func pickRetryIndex(channels: [RouteChannel], excluding name: String) -> Int {
+    ///
+    /// - Parameter excludeThrottled: 尾段隔离时一并排除被限流通道（与安卓端一致）。
+    private static func pickRetryIndex(channels: [RouteChannel], excluding name: String,
+                                       excludeThrottled: Bool = false) -> Int {
         guard channels.count > 1 else { return 0 }
         var total: Double = 0
         var weights: [Double] = []
         weights.reserveCapacity(channels.count)
         for ch in channels {
             if ch.name == name {
+                weights.append(0)
+                continue
+            }
+            if excludeThrottled, ch.throttled {
                 weights.append(0)
                 continue
             }

@@ -1,6 +1,6 @@
 import Foundation
 
-enum ArchiveFormat: String, Hashable, Sendable {
+enum ArchiveFormat: String, Hashable, Sendable, Codable {
     case zip
     case tarball
 
@@ -10,7 +10,7 @@ enum ArchiveFormat: String, Hashable, Sendable {
 }
 
 /// 能加速下载的东西：构建产物 / 构建日志 / 发行版附件 / 源码包
-enum DownloadSource: Hashable, Sendable {
+enum DownloadSource: Hashable, Sendable, Codable {
     case artifact(repo: String, id: Int64)
     case runLogs(repo: String, runID: Int64)
     /// - Parameter browserURL: 该附件在 github.com 上的**稳定公开地址**
@@ -20,6 +20,70 @@ enum DownloadSource: Hashable, Sendable {
     ///   拿不到 tag 时为 nil，此时退回原行为（只用签名地址 + 常规镜像）。
     case releaseAsset(repo: String, assetID: Int64, browserURL: String? = nil)
     case sourceArchive(repo: String, ref: String, format: ArchiveFormat)
+
+    // MARK: - Codable（后台续下时任务落盘用，带关联值的手写编解码）
+
+    private enum Kind: String, Codable {
+        case artifact
+        case runLogs
+        case releaseAsset
+        case sourceArchive
+    }
+
+    private enum Keys: String, CodingKey {
+        case kind
+        case repo
+        case id
+        case runID
+        case assetID
+        case browserURL
+        case ref
+        case format
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: Keys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .artifact:
+            self = .artifact(repo: try container.decode(String.self, forKey: .repo),
+                             id: try container.decode(Int64.self, forKey: .id))
+        case .runLogs:
+            self = .runLogs(repo: try container.decode(String.self, forKey: .repo),
+                            runID: try container.decode(Int64.self, forKey: .runID))
+        case .releaseAsset:
+            self = .releaseAsset(repo: try container.decode(String.self, forKey: .repo),
+                                 assetID: try container.decode(Int64.self, forKey: .assetID),
+                                 browserURL: try container.decodeIfPresent(String.self, forKey: .browserURL))
+        case .sourceArchive:
+            self = .sourceArchive(repo: try container.decode(String.self, forKey: .repo),
+                                  ref: try container.decode(String.self, forKey: .ref),
+                                  format: try container.decode(ArchiveFormat.self, forKey: .format))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: Keys.self)
+        switch self {
+        case .artifact(let repo, let id):
+            try container.encode(Kind.artifact, forKey: .kind)
+            try container.encode(repo, forKey: .repo)
+            try container.encode(id, forKey: .id)
+        case .runLogs(let repo, let runID):
+            try container.encode(Kind.runLogs, forKey: .kind)
+            try container.encode(repo, forKey: .repo)
+            try container.encode(runID, forKey: .runID)
+        case .releaseAsset(let repo, let assetID, let browserURL):
+            try container.encode(Kind.releaseAsset, forKey: .kind)
+            try container.encode(repo, forKey: .repo)
+            try container.encode(assetID, forKey: .assetID)
+            try container.encodeIfPresent(browserURL, forKey: .browserURL)
+        case .sourceArchive(let repo, let ref, let format):
+            try container.encode(Kind.sourceArchive, forKey: .kind)
+            try container.encode(repo, forKey: .repo)
+            try container.encode(ref, forKey: .ref)
+            try container.encode(format, forKey: .format)
+        }
+    }
 
     /// 源码包由 GitHub 现场打包，不支持 Range 分段，只能单连接下载
     var supportsChunkedDownload: Bool {
@@ -55,7 +119,7 @@ enum DownloadSource: Hashable, Sendable {
 }
 
 /// 界面上一行「可下载项」
-struct DownloadItem: Identifiable, Hashable, Sendable {
+struct DownloadItem: Identifiable, Hashable, Sendable, Codable {
     let id: String
     let title: String
     let subtitle: String

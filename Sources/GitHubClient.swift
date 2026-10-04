@@ -70,8 +70,7 @@ final class GitHubClient: Sendable {
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         // 普通 API 单次 45s 封顶（与安卓端 apiClient callTimeout 对应）：
-        // URLSession.shared 改不了配置，只能逐请求设 idle 超时，
-        // 总时长另由各调用方的 withTimeout 兜底（如找测速目标 20s）。
+        // URLSession.shared 改不了配置，只能逐请求设 idle 超时。
         req.timeoutInterval = 45
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
