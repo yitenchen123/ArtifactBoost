@@ -82,16 +82,39 @@ struct SettingsView: View {
 
     private var accelerationSection: some View {
         Section {
-            Picker("并发连接数", selection: connectionsBinding) {
-                ForEach(AccelerationSettings.connectionOptions, id: \.self) { count in
-                    Text("\(count)").tag(count)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("并发上限")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text("\(settings.connections)")
+                        .font(.system(size: 17, weight: .heavy, design: .rounded))
+                        .foregroundStyle(Theme.blue)
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                }
+
+                Picker("并发连接数", selection: connectionsBinding) {
+                    ForEach(AccelerationSettings.connectionOptions, id: \.self) { count in
+                        Text("\(count)").tag(count)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                HStack(spacing: 6) {
+                    Image(systemName: "wand.and.stars")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Theme.purple)
+                    Text("自适应引擎会按服务器反馈自动增减并发，这里设的只是天花板")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.subtle)
                 }
             }
-            .pickerStyle(.segmented)
         } header: {
             Text("加速设置")
         } footer: {
-            Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。")
+            Text("这是**上限**而不是固定连接数。引擎用 AIMD 自适应算法：下载顺畅时慢慢往上爬（最多爬到上限），一遇限流（429/503）立刻砍半退让。所以设 128 不会像以前那样盲目砸 128 条连接撞限流 —— 只会给引擎更高的天花板。一般 16~32 就够，自建中转可以拉到 64~128。")
         }
     }
 
@@ -107,6 +130,8 @@ struct SettingsView: View {
                              accent: Theme.accent) {
                     settings.mode = .direct
                     settings.save()
+                    // 换源后旧的通道排序不再适用，清掉探测缓存
+                    RouteProbeCache.shared.invalidateAll()
                 }
                 SourceButton(title: "镜像加速",
                              subtitle: "多通道并行 · 推荐",
@@ -115,6 +140,7 @@ struct SettingsView: View {
                              accent: Theme.green) {
                     settings.mode = .smart
                     settings.save()
+                    RouteProbeCache.shared.invalidateAll()
                 }
             }
             .buttonStyle(.plain)
@@ -156,7 +182,9 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         Section {
-            LabeledContent("版本", value: "1.2")
+            LabeledContent("版本", value: "2.0")
+            LabeledContent("并发引擎", value: "AIMD 自适应")
+            LabeledContent("通道探测", value: "并发 + 5 分钟缓存")
             Link(destination: URL(string: "https://github.com/yitenchen123/ArtifactBoost")!) {
                 Label("项目主页 / 自建中转教程", systemImage: "link")
             }

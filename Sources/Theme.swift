@@ -62,6 +62,33 @@ enum Theme {
     /// 卡片内边距（对应 Android 的 14dp ≈ medium 形状档）
     static let cardPadding: CGFloat = 14
 
+    // MARK: - 渐变（视觉升级用）
+
+    /// 品牌渐变：加速相关的强调元素统一用它（进度条、主按钮、徽标底）
+    static var brandGradient: LinearGradient {
+        LinearGradient(colors: [blue, purple],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    /// 速度渐变：速度越快颜色越"热"，用于实时速度数字
+    static var speedGradient: LinearGradient {
+        LinearGradient(colors: [green, blue],
+                       startPoint: .leading, endPoint: .trailing)
+    }
+
+    /// 卡片微渐变底色：让卡片不再是死板的纯色块
+    static var cardGradient: LinearGradient {
+        LinearGradient(colors: [surface, canvas.opacity(0.6)],
+                       startPoint: .top, endPoint: .bottom)
+    }
+
+    // MARK: - 阴影
+
+    /// 卡片阴影：浅色模式用轻投影，深色模式几乎不投影（否则发灰）
+    static func cardShadow(elevated: Bool = false) -> (color: Color, radius: CGFloat, y: CGFloat) {
+        (Color.black.opacity(elevated ? 0.10 : 0.06), elevated ? 12 : 6, elevated ? 5 : 2)
+    }
+
     // MARK: - Primer 调色板
     static let blue = Color.adaptive(light: 0x0969DA, dark: 0x2F81F7)
     static let green = Color.adaptive(light: 0x1F883D, dark: 0x3FB950)
@@ -256,26 +283,67 @@ struct EmptyStateView: View {
     }
 }
 
-/// 卡片容器：MD3 outlined card —— 1pt 描边 + medium 圆角。
-/// 对齐 Android 侧的 `OutlinedCard`（`CardDefaults.outlinedCardColors` + 1dp border）。
+/// 卡片容器：MD3 outlined card —— 1pt 描边 + medium 圆角 + 极轻投影。
+/// 对齐 Android 侧的 `OutlinedCard`（`CardDefaults.outlinedCardColors` + 1dp border），
+/// 额外加一层几乎看不见的投影让卡片"浮起来"一点，比纯描边更有层次。
 struct CardBackground: ViewModifier {
     var padding: CGFloat = Theme.cardPadding
+    var cornerRadius: CGFloat = Theme.Radius.medium
+    var elevated: Bool = false
 
     func body(content: Content) -> some View {
+        let shadow = Theme.cardShadow(elevated: elevated)
         content
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(Theme.surface)
+            }
             .overlay {
-                RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(Theme.border, lineWidth: 1)
             }
+            .shadow(color: shadow.color, radius: shadow.radius, y: shadow.y)
     }
 }
 
 extension View {
     func card(padding: CGFloat = Theme.cardPadding) -> some View {
         modifier(CardBackground(padding: padding))
+    }
+
+    func card(padding: CGFloat = Theme.cardPadding,
+              cornerRadius: CGFloat,
+              elevated: Bool = false) -> some View {
+        modifier(CardBackground(padding: padding, cornerRadius: cornerRadius, elevated: elevated))
+    }
+}
+
+/// 品牌渐变描边卡：用于「正在下载」这种需要一眼抓住注意力的容器
+struct GradientBorderCard: ViewModifier {
+    var padding: CGFloat = Theme.cardPadding
+    var active: Bool = false
+
+    func body(content: Content) -> some View {
+        content
+            .padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
+                    .fill(Theme.surface)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
+                    .strokeBorder(Theme.brandGradient,
+                                  lineWidth: active ? 1.6 : 1)
+            }
+    }
+}
+
+extension View {
+    func gradientCard(padding: CGFloat = Theme.cardPadding, active: Bool = false) -> some View {
+        modifier(GradientBorderCard(padding: padding, active: active))
     }
 }
 
@@ -292,5 +360,139 @@ struct ErrorBanner: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 2)
+    }
+}
+
+// MARK: - 视觉升级组件
+
+/// 渐变进度条：比系统 ProgressView 更有速度感。
+///
+/// 用 `.animation(.linear)` 让进度推进是连续滑动而不是一格格跳，
+/// 但**不**对 fraction 做 spring 动画（快速下载时那会让进度条"追不上"）。
+struct GradientProgressBar: View {
+    let fraction: Double
+    var height: CGFloat = 8
+    var tint: LinearGradient = Theme.brandGradient
+    /// 是否处于"卡住"状态：卡住时条会慢速呼吸，提示用户不是界面死了
+    var stalled: Bool = false
+
+    @State private var breathe = false
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Theme.border.opacity(0.5))
+                Capsule()
+                    .fill(tint)
+                    .frame(width: max(geo.size.width * min(max(fraction, 0), 1), fraction > 0 ? height : 0))
+                    .opacity(stalled ? (breathe ? 0.45 : 1) : 1)
+                    .animation(.linear(duration: 0.25), value: fraction)
+            }
+        }
+        .frame(height: height)
+        .onAppear {
+            guard stalled else { return }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                breathe = true
+            }
+        }
+    }
+}
+
+/// 速度徽标：把「12.4 MB/s」做成一眼能读到重点的胶囊。
+/// 数字用等宽字体，速度刷新时宽度不跳。
+struct SpeedBadge: View {
+    let bytesPerSecond: Double
+    var compact: Bool = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "bolt.fill")
+                .font(.system(size: compact ? 9 : 10, weight: .bold))
+            Text(formatSpeed(bytesPerSecond))
+                .font(.system(size: compact ? 11 : 12, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .contentTransition(.numericText())
+        }
+        .foregroundStyle(Theme.green)
+        .padding(.horizontal, compact ? 7 : 9)
+        .padding(.vertical, compact ? 3 : 4)
+        .background(Theme.green.opacity(0.12), in: Capsule())
+    }
+}
+
+/// 分段连接热力条：一眼看出上百条连接里哪几条在跑、哪几条卡住。
+/// 每条用 2pt 宽的小竖条表示，颜色按状态走 —— 比文字列表直观得多。
+///
+/// 按 `max(lanes.count, 1)` 均分宽度：条数少时每条更宽（更容易看出状态），
+/// 条数上百时自动收窄成细线 —— 128 条连接也不会糊成一团。
+struct LaneHeatStrip: View {
+    let lanes: [LaneSnapshot]
+    let target: Int
+
+    var body: some View {
+        GeometryReader { geo in
+            let slots = max(lanes.count, 1)
+            let slot = geo.size.width / CGFloat(slots)
+            let width = max(slot - 1.5, 1)
+
+            HStack(spacing: 1.5) {
+                ForEach(lanes) { lane in
+                    Capsule()
+                        .fill(color(for: lane.state))
+                        .frame(width: width)
+                }
+            }
+        }
+        .frame(height: 14)
+        // target 目前只用于可访问性描述（未来可做「空槽位」可视化）
+        .accessibilityLabel("\(lanes.count) 条连接，目标 \(target) 条")
+    }
+
+    private func color(for state: SegmentState) -> Color {
+        switch state {
+        case .pending: return Theme.border
+        case .downloading: return Theme.green
+        case .retrying: return Theme.orange
+        case .done: return Theme.blue.opacity(0.7)
+        case .failed: return Theme.red
+        }
+    }
+}
+
+/// 圆角统计瓦片：把数字做大，标签做小 —— 信息密度和可读性兼顾
+struct MetricTile: View {
+    let label: String
+    let value: String
+    var tint: Color = Theme.strongText
+    var systemImage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 3) {
+                if let systemImage {
+                    Image(systemName: systemImage).font(.system(size: 9, weight: .bold))
+                }
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(Theme.subtle)
+            Text(value)
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(Theme.canvas.opacity(0.7),
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
+                .stroke(Theme.border.opacity(0.7), lineWidth: 1)
+        }
     }
 }

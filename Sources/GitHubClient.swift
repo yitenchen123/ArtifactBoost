@@ -173,9 +173,15 @@ final class GitHubClient: Sendable {
     /// GitHub 对这些接口都会 302 跳转到带签名的真实地址（产物/日志在 Azure Blob，
     /// 源码包在 codeload），这里拦下跳转拿到真实地址，后续分段下载直接打这个地址
     /// （不再需要 Token，也不再经过 api.github.com）。
+    ///
+    /// 加速要点：不再真的把请求发完 —— 用 `.stopLoading` 在**收到 302 响应头**的
+    /// 瞬间就掐断连接。产物是几百 MB 的资源，走完 HEAD/GET 的整个响应体纯属浪费；
+    /// 302 一出现 Location 就有了。
     func resolveDownloadURL(for source: DownloadSource) async throws -> URL {
         var extraHeaders: [String: String] = [:]
-        let path: String
+        // 解析阶段用 HEAD：只要 302 头，不要正文。
+        // 少数镜像/接口对 HEAD 支持不好时下面会自动退回 GET。
+        var path: String
         switch source {
         case .artifact(let repo, let id):
             path = "repos/\(repo)/actions/artifacts/\(id)/zip"
@@ -191,40 +197,88 @@ final class GitHubClient: Sendable {
         }
 
         let url = try makeURL(path)
-        var request = authorizedRequest(url)
-        // 解析阶段永远直连 api.github.com：idle 30s 封顶（与安卓端 redirectClient 对应），
-        // 总时长另由 performDownload 的 30s 限时兜底。
-        request.timeoutInterval = 30
-        for (key, value) in extraHeaders {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
 
-        let session = URLSession(configuration: .ephemeral, delegate: RedirectCatcher(), delegateQueue: nil)
+        // 先试 HEAD（最快，不产生正文传输），拿不到 302 再退回 GET。
+        let methods = ["HEAD", "GET"]
+        var lastError: Error = GitHubError.downloadURLNotFound
+        for (index, method) in methods.enumerated() {
+            var request = authorizedRequest(url)
+            request.httpMethod = method
+            // 解析阶段永远直连 api.github.com：idle 30s 封顶（与安卓端 redirectClient 对应），
+            // 总时长另由 performDownload 的 30s 限时兜底。
+            request.timeoutInterval = 30
+            for (key, value) in extraHeaders {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+
+            do {
+                let (data, resp) = try await Self.fetchRedirectOnly(request)
+                guard let http = resp as? HTTPURLResponse else { throw GitHubError.badResponse }
+                if http.statusCode == 410 { throw GitHubError.artifactExpired }
+                if http.statusCode == 302 || http.statusCode == 303,
+                   let location = http.value(forHTTPHeaderField: "Location"),
+                   let signed = URL(string: location) {
+                    return signed
+                }
+                if !(200..<300).contains(http.statusCode) {
+                    let message = (try? JSONDecoder().decode(GHErrorMessage.self, from: data))?.message ?? ""
+                    throw GitHubError.http(http.statusCode, message)
+                }
+                // 2xx 但没跳转：HEAD 不被支持，换 GET 再试一次
+                lastError = GitHubError.downloadURLNotFound
+            } catch let error as GitHubError {
+                // 410/4xx 这类明确结论直接抛，不做无谓的第二次请求
+                switch error {
+                case .artifactExpired:
+                    throw error
+                case .http(let code, _) where code == 401 || code == 404 || code == 403:
+                    throw error
+                default:
+                    lastError = error
+                }
+            } catch {
+                lastError = error
+            }
+            // 只有第一次（HEAD）失败才值得换 GET
+            if index == methods.count - 1 { break }
+        }
+        throw lastError
+    }
+
+    /// 只取响应头、丢弃正文：拦下 302 后立刻 `stopLoading`，
+    /// 不让 URLSession 继续把几百 MB 的产物正文拉下来。
+    private static func fetchRedirectOnly(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        let delegate = RedirectCatcher()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
-        let (data, resp) = try await session.data(for: request)
-        guard let http = resp as? HTTPURLResponse else { throw GitHubError.badResponse }
-        if http.statusCode == 410 { throw GitHubError.artifactExpired }
-        if http.statusCode == 302 || http.statusCode == 303,
-           let location = http.value(forHTTPHeaderField: "Location"),
-           let signed = URL(string: location) {
-            return signed
-        }
-        if !(200..<300).contains(http.statusCode) {
-            let message = (try? JSONDecoder().decode(GHErrorMessage.self, from: data))?.message ?? ""
-            throw GitHubError.http(http.statusCode, message)
-        }
-        throw GitHubError.downloadURLNotFound
+        return try await session.data(for: request)
     }
 }
 
-/// 阻止 URLSession 自动跟随 302，把跳转响应原样返回
-private final class RedirectCatcher: NSObject, URLSessionTaskDelegate {
+/// 阻止 URLSession 自动跟随 302，把跳转响应原样返回。
+///
+/// 额外做了「拿到 302 立刻掐断」：产物正文动辄几百 MB，而我们要的只有
+/// `Location` 头。回 nil 让 URLSession 不再跟随跳转，配合下面的
+/// `didReceive response` 里对 3xx 调 `stopLoading`，连接在响应头阶段就结束。
+private final class RedirectCatcher: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
     func urlSession(_ session: URLSession,
                     task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        // 3xx：Location 已经拿到了，正文不需要，直接结束这个 task
+        if let http = response as? HTTPURLResponse, (300..<400).contains(http.statusCode) {
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
     }
 }
 

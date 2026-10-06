@@ -24,6 +24,9 @@ final class DownloadManager: ObservableObject {
     /// 未完成任务的落盘：进程被杀后靠它自动续下
     private let taskStore = DownloadTaskStore()
 
+    /// 通道探测缓存（按 host 复用 5 分钟），解决「每次下载都要重新试一遍死镜像」
+    private let probeCache = RouteProbeCache.shared
+
     let session: SessionManager
 
     init(session: SessionManager) {
@@ -232,17 +235,52 @@ final class DownloadManager: ObservableObject {
         // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedURL。
         let githubURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
 
-        // 无测速：候选通道直接全部并行，初始权重均等，
-        // 引擎下载中按实时吞吐动态调整分配。
         let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: githubURL)
-        let plan = candidates.map { ScoredRoute(route: $0, speed: 1) }
+        // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址
+        let basePlan = candidates.map { ScoredRoute(route: $0, speed: 1) }
+        var routeURLs = Self.resolveRouteURLs(basePlan, signedURL: signedURL, githubURL: githubURL)
+
+        // 通道探测（已探过的 5 分钟内直接复用）：
+        // 老实现是「按设置里的固定顺序串行先用第一条」，4 个镜像里前 3 个是死的
+        // 就得干等三次超时 —— 用户体感就是「下不动 / 半天才开始」。
+        // 现在同时探测所有候选，可用的先上岗，死的立刻剔除，并把实测速度
+        // 作为初始权重喂给引擎（不再是从均等的 1 开始瞎试）。
+        var plan: [ScoredRoute]
+        // 探测只在「多通道」时才有意义：单通道（私有仓库直连 / 官方源）直接跳过。
+        // 自定义模式同样受益 —— 先探一下自己的中转通不通，不通就直接走直连，
+        // 不用先让引擎在坏前缀上失败一轮再回退。
+        if candidates.count > 1 {
+            if let host = signedURL.host, let cached = probeCache.cached(for: host) {
+                // 缓存里可能混有「这次不适用」的通道（比如 ghfast 只对发行版有效），
+                // 按本次候选过滤一遍再用，避免把无关通道塞回计划。
+                let names = Set(candidates.map { $0.name })
+                let filtered = cached.filter { names.contains($0.route.name) }
+                plan = Self.plan(from: filtered, candidates: candidates)
+            } else {
+                routeSummary[item.id] = "正在探测最快通道…"
+                let probes = await probeCache.probe(routes: candidates, routeURLs: routeURLs)
+                if let host = signedURL.host { probeCache.store(probes, for: host) }
+                plan = Self.plan(from: probes, candidates: candidates)
+            }
+            // 探测后按新的顺序重排 URL，保证 plan 与 routeURLs 一一对应
+            routeURLs = plan.map { scored in
+                switch scored.route.scope {
+                case .any: return scored.route.apply(to: signedURL)
+                case .githubOnly:
+                    guard let githubURL else { return scored.route.apply(to: signedURL) }
+                    return scored.route.apply(to: githubURL)
+                }
+            }
+            routeSummary[item.id] = nil
+        } else {
+            plan = basePlan
+        }
+
         let note = (item.isPrivate && settings.mode == .smart)
             ? "直连（私有仓库不走镜像）"
             : Self.describe(plan)
 
         let connections = settings.clampedConnections
-        // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址
-        let routeURLs = Self.resolveRouteURLs(plan, signedURL: signedURL, githubURL: githubURL)
 
         do {
             let result = try await engine.download(routeURLs: routeURLs,
@@ -256,6 +294,8 @@ final class DownloadManager: ObservableObject {
         } catch {
             // 通道可能失效/被限流，整体回退直连再试一次
             guard Self.shouldRetry(error), plan.contains(where: { !$0.route.isDirect }) else { throw error }
+            // 顺带把探测缓存清掉：这次全军覆没说明排序已经不适用了
+            probeCache.invalidateAll()
             let result = try await engine.download(routeURLs: [signedURL],
                                                    routes: [ScoredRoute(route: .direct, speed: 1)],
                                                    fileName: item.fileName,
@@ -265,6 +305,26 @@ final class DownloadManager: ObservableObject {
             routeSummary[item.id] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
         }
+    }
+
+    /// 把探测结果映射成「带初始权重的通道计划」。
+    ///
+    /// 规则：
+    ///  - 探测可用的通道按实测速度给权重（引擎一开始就把活儿压到真正的快线上）；
+    ///  - 探测不可用的通道剔除，但**直连永远保留**（引擎的最终兜底依赖它，
+    ///    而且探测失败也可能只是那一次握手抖动）；
+    ///  - 全部不可用时保留原样，让引擎自己按老逻辑兜底。
+    private static func plan(from probes: [RouteProbe],
+                             candidates: [DownloadRoute]) -> [ScoredRoute] {
+        guard !probes.isEmpty else { return candidates.map { ScoredRoute(route: $0, speed: 1) } }
+        var usable = probes.filter { $0.ok }
+        // 直连必须留在计划里（兜底通道）
+        if !usable.contains(where: { $0.route.isDirect }),
+           let directProbe = probes.first(where: { $0.route.isDirect }) {
+            usable.append(directProbe)
+        }
+        let source = usable.isEmpty ? probes : usable
+        return source.map { ScoredRoute(route: $0.route, speed: max($0.speed, 1)) }
     }
 
     /// 给每条通道算出实际请求的 URL。

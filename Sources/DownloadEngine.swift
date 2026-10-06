@@ -73,6 +73,15 @@ struct DownloadDiagnostics: Equatable, Sendable {
     let routes: [RouteStats]
     /// 当前正在用的下载地址（可复制）
     let activeUrl: String
+    /// 自适应并发窗口：引擎自己爬到的「服务器愿意给的并发」。
+    /// 用户设的是上限，这个值才是当前实际在用的档位。
+    var adaptiveWindow: Int = 0
+    /// 是否检测到卡住（看门狗触发）
+    var stalled: Bool = false
+    /// AIMD 窗口的涨/缩次数与峰值（诊断面板用）
+    var windowIncreases: Int = 0
+    var windowDecreases: Int = 0
+    var windowPeak: Int = 0
 }
 
 enum DownloadError: LocalizedError, Equatable {
@@ -118,10 +127,20 @@ struct DownloadResult {
 private struct Chunk: Sendable {
     let start: Int64
     let end: Int64
+    /// 这一片被推迟到什么时候才能再被取走（失败退避用）。
+    /// nil 表示立刻可取 —— 正常切分/续做出来的区间都是 nil。
+    var notBefore: Date? = nil
+
     var length: Int64 { end - start + 1 }
 }
 
-/// 待下载区间的池子（滑动窗口）
+/// 待下载区间的池子（滑动窗口 + 失败退避）。
+///
+/// 关键修复：老实现里失败的片直接 `insert(at: 0)` 插回队首，
+/// 下一个空闲 worker 立刻又把它捞走重试 —— 服务器正在限流时，
+/// 这就成了一个「疯狂撞墙」的热循环：连接数不掉、吞吐为零、
+/// 用户看到的正是「卡住」。现在失败区间带 `notBefore` 退避时间，
+/// 在到点之前对 `take()` 不可见，调度器自然会去干别的活儿。
 private final class SlicePool: @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Chunk] = []
@@ -133,6 +152,8 @@ private final class SlicePool: @unchecked Sendable {
     private var completed: Int64 = 0
     private(set) var failures = 0
     private(set) var throttles = 0
+    /// 已成功取走的片数 / 仍在排队的片数（诊断用）
+    private(set) var dispatched = 0
 
     var backlog: Int {
         lock.lock(); defer { lock.unlock() }
@@ -166,31 +187,57 @@ private final class SlicePool: @unchecked Sendable {
         lock.lock(); throttles += 1; lock.unlock()
     }
 
-    /// 取一段活儿；没有就返回 nil，由调度循环决定要不要切分
+    /// 取一段活儿；没有（或都在退避中）就返回 nil，由调度循环决定要不要切分。
+    ///
+    /// 会跳过还在退避期的区间 —— 这是修「失败片立刻被重取」热循环的关键。
     func take() -> Chunk? {
         lock.lock(); defer { lock.unlock() }
-        let chunk = queue.isEmpty ? nil : queue.removeFirst()
+        let now = Date()
+        guard let index = queue.firstIndex(where: { ($0.notBefore ?? .distantPast) <= now }) else {
+            return nil
+        }
+        let chunk = queue.remove(at: index)
+        dispatched += 1
         checkInvariantsLocked()
         return chunk
     }
 
-    /// 把没下完的区间还回队列最前面
-    func putBack(_ chunk: Chunk) {
-        lock.lock(); queue.insert(chunk, at: 0); checkInvariantsLocked(); lock.unlock()
+    /// 退避中的区间还剩几个（调度器据此决定等多久）
+    func deferredCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        return queue.filter { ($0.notBefore ?? .distantPast) > now }.count
     }
 
-    /// 池子空了、但还有连接闲着时调用：从队列末尾挑一段砍成两半
+    /// 把没下完的区间插回队列最前面。
+    ///
+    /// - Parameter backoff: 多久之后才允许再被取走。失败重派时必须给非零值，
+    ///   否则就是老实现那个「立刻重取、疯狂撞墙」的热循环。
+    func putBack(_ chunk: Chunk, backoff: TimeInterval = 0) {
+        lock.lock()
+        var scheduled = chunk
+        if backoff > 0 {
+            scheduled.notBefore = Date().addingTimeInterval(backoff)
+        }
+        queue.insert(scheduled, at: 0)
+        checkInvariantsLocked()
+        lock.unlock()
+    }
+
+    /// 池子空了、但还有连接闲着时调用：从队列末尾挑一段砍成两半。
+    ///
+    /// 只砍「立刻可取」的区间；正在退避的区间不动它们，
+    /// 免得把一块还没到期的坏区间砍碎后到处散落。
     func splitTail(live: Int, target: Int) -> Chunk? {
         guard live > 0 else { return nil }
         lock.lock(); defer { lock.unlock() }
-        guard let victim = queue.popLast() else { return nil }
-        guard victim.length > Int64(target) else {
-            queue.append(victim)
-            checkInvariantsLocked()
-            return nil
-        }
+        let now = Date()
+        guard let index = queue.lastIndex(where: { ($0.notBefore ?? .distantPast) <= now })
+        else { return nil }
+        let victim = queue[index]
+        guard victim.length > Int64(target) else { return nil }
         let half = victim.length / 2
-        queue.append(Chunk(start: victim.start + half, end: victim.end))
+        queue[index] = Chunk(start: victim.start + half, end: victim.end)
         splits += 1
         checkInvariantsLocked()
         return Chunk(start: victim.start, end: victim.start + half - 1)
@@ -219,6 +266,49 @@ private final class SlicePool: @unchecked Sendable {
             prevEnd = chunk.end
         }
         #endif
+    }
+}
+
+/// 「还没到 deadline 就已经不动了」的看门狗。
+///
+/// URLSession 的 `timeoutIntervalForRequest` 是 **idle 超时**，理想情况下
+/// 卡住的连接能自己超时。但现实里两层代理/CDN 会持续吐心跳字节（KEEPALIVE），
+/// idle 计时器不断被重置，那条连接就「看着在动、实际一动不动」地挂着 ——
+/// 用户看到的就是「时不时卡住」。这里用「进度没涨」而不是「没收到字节」来判：
+/// 只有真正写入文件的字节才重置计时器，心跳字节不算。
+private final class StallWatchdog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var progress: Int64 = 0
+    private var lastProgressAt = Date()
+    /// 多久没有任何一片写完就判定「卡住」（秒）
+    private let stallWindow: TimeInterval
+
+    init(stallWindow: TimeInterval = 12) {
+        self.stallWindow = stallWindow
+    }
+
+    func noteProgress(_ bytes: Int64) {
+        lock.lock()
+        progress += bytes
+        lastProgressAt = Date()
+        lock.unlock()
+    }
+
+    var totalProgress: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return progress
+    }
+
+    var stalledFor: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(lastProgressAt)
+    }
+
+    var isStalled: Bool { stalledFor > stallWindow }
+
+    /// 恢复进度（卡住后重新派活了，计时器重置）
+    func reset() {
+        lock.lock(); lastProgressAt = Date(); lock.unlock()
     }
 }
 
@@ -393,6 +483,33 @@ private final class LaneBoard: @unchecked Sendable {
     private(set) var throttles = 0
     private(set) var splits = 0
     private var _activeUrl = ""
+    /// 自适应窗口 / 卡住标志：由调度循环每拍写入，UI 直接读走
+    private var _adaptiveWindow = 0
+    private var _stalled = false
+    /// AIMD 窗口统计（调度循环写入，快照读出）
+    private var _windowIncreases = 0
+    private var _windowDecreases = 0
+    private var _windowPeak = 0
+
+    /// 调度循环每拍把 AIMD 的实时状态同步进看板
+    func syncWindow(current: Int, increases: Int, decreases: Int, peak: Int) {
+        lock.lock()
+        _adaptiveWindow = current
+        _windowIncreases = increases
+        _windowDecreases = decreases
+        _windowPeak = peak
+        lock.unlock()
+    }
+
+    var adaptiveWindow: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _adaptiveWindow }
+        set { lock.lock(); _adaptiveWindow = newValue; lock.unlock() }
+    }
+
+    var stalled: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _stalled }
+        set { lock.lock(); _stalled = newValue; lock.unlock() }
+    }
 
     init(target: Int) { self.target = target }
 
@@ -441,6 +558,8 @@ private final class LaneBoard: @unchecked Sendable {
         lock.lock()
         let laneValues = lanes.values.sorted { $0.start < $1.start }
         let d = doneSlices, t = totalSlices, r = retries, th = throttles, sp = splits, url = _activeUrl
+        let win = _adaptiveWindow, st = _stalled
+        let inc = _windowIncreases, dec = _windowDecreases, pk = _windowPeak
         lock.unlock()
         return DownloadDiagnostics(lanes: laneValues,
                                    targetLanes: target,
@@ -450,7 +569,12 @@ private final class LaneBoard: @unchecked Sendable {
                                    throttles: th,
                                    splits: sp,
                                    routes: routes,
-                                   activeUrl: url)
+                                   activeUrl: url,
+                                   adaptiveWindow: win,
+                                   stalled: st,
+                                   windowIncreases: inc,
+                                   windowDecreases: dec,
+                                   windowPeak: pk)
     }
 }
 
@@ -711,49 +835,73 @@ final class DownloadEngine: @unchecked Sendable {
             // 调度循环因此**绝不阻塞等待 worker 退出** —— 每一轮都能重新
             // 尝试派活，worker 把尾部区间还回池子的瞬间，新 worker 就能补位。
             let active = ConcurrencyCounter()
+            let limiter = AdaptiveConcurrency(ceiling: lanes)
+            // 卡住看门狗：12s 没有任何字节落盘就判定「卡住」并主动拆掉重连
+            let watchdog = StallWatchdog(stallWindow: Self.stallWindow)
             var roundRobin = 0
-
-            // 渐进建连：不再一上来就把 lanes 顶满。
-            // 起步瞬间几百个请求同时砸过去，Azure/Cloudflare 会直接回 503 ServerBusy，
-            // 一旦被限流就得指数退避，整段下载反而更慢。
-            // 改成每 connectionRampInterval 秒放一档，跑到目标并发后再全速调度。
-            var allowedLanes = min(Self.rampStep(for: lanes), lanes)
-            var lastRampAt = Date()
 
             // 无进展保护：所有 worker 都在「失败→重派→再失败」里空转、
             // 文件一个字节都没涨，这种状态持续 90 秒就判定全线失败。
             // 没有它，全线断网/磁盘写挂时调度器会永远空转下去。
             var lastProgressBytes = pool.downloaded()
             var lastProgressAt = Date()
+            // 卡住时的强制重建：掐掉所有在飞连接，让调度器用新连接重来
+            var lastStallBreak = Date.distantPast
 
             while true {
                 // 取消后立刻退出调度循环，不再派新活儿
                 if isCancelled || inflight.isCancelling { break }
 
-                // 无进展保护（worker 失败时是让位退出而不是抛错，全靠这里兜底）
+                // 无进展保护（worker 失败时是让位退出而不是抛错，全靠这里兜底）。
+                // 判据是「池子里还有活儿（在跑 或 在退避）却一直没涨」，
+                // 不能只看 active.current —— 全部区间都在退避时 active 可能是 0，
+                // 那种情况下同样不能永远等下去。
                 let downloaded = pool.downloaded()
                 if downloaded != lastProgressBytes {
                     lastProgressBytes = downloaded
                     lastProgressAt = Date()
-                } else if active.current > 0, Date().timeIntervalSince(lastProgressAt) > 90 {
+                } else if (active.current > 0 || pool.deferredCount() > 0 || pool.backlog > 0),
+                          Date().timeIntervalSince(lastProgressAt) > 90 {
                     throw DownloadError.incomplete
                 }
 
-                // 0) 建连爬坡：到点就放开一档并发
-                let now = Date()
-                if allowedLanes < lanes,
-                   now.timeIntervalSince(lastRampAt) >= Self.connectionRampInterval {
-                    allowedLanes = min(allowedLanes + Self.rampStep(for: lanes), lanes)
-                    lastRampAt = now
+                // 0) 卡住检测：有连接在飞、但一个字节都没落盘超过 12 秒。
+                //
+                // 这正是用户说的「时不时卡住」：CDN 的心跳字节让 URLSession 的
+                // idle 超时永远不触发，那条连接就这么挂着。这里由看门狗主动出手 ——
+                // 掐掉所有在飞请求（含它们各自的 20s+ 单片超时），调度循环下一轮
+                // 会用全新的连接重新派活；同时把窗口砍一刀，避免再扑上去撞同一堵墙。
+                if active.current > 0, watchdog.isStalled,
+                   Date().timeIntervalSince(lastStallBreak) > 5 {
+                    lastStallBreak = Date()
+                    board.stalled = true
+                    inflight.abortAll()
+                    limiter.noteFailure()
+                    watchdog.reset()
+                    lastProgressAt = Date()
+                    // 给被掐掉的 worker 一点时间退出，再重新评估
+                    try? await Task.sleep(for: .milliseconds(120))
+                    continue
+                } else if !watchdog.isStalled {
+                    board.stalled = false
                 }
 
-                // 1) 把并发顶到「当前允许值」；通道被限流时按配额收缩
+                // 1) 把并发顶到「当前允许值」；通道被限流时按配额收缩。
+                //
+                // 这里的 allowed 不再来自固定时间片的爬坡，而是 AIMD 窗口：
+                // 顺畅时自己涨（≈ 用户设的上限封顶），命中限流立刻砍半。
+                // 用户把并发拉到 128 只会让「上限」更高，不会真的盲目砸 128 条连接。
                 var assigned = false
                 // 尾段只派快通道：剩的不够全员分时，再按权重抽中慢线，
                 // 整体完成时间就被最慢那一片 gate 住（与安卓端一致）。
                 let tailIsolated = Self.isTailRemaining(remaining: max(total - pool.downloaded(), 0),
                                                         lanes: lanes)
-                while active.current < allowedLanes {
+                let windowNow = limiter.currentWindow
+                board.syncWindow(current: windowNow,
+                                 increases: limiter.increases,
+                                 decreases: limiter.decreases,
+                                 peak: limiter.peakWindow)
+                while active.current < windowNow, limiter.canDispatch(inflight: active.current) {
                     // 此刻实际可用的并发额度：被限流的通道要临时降额，
                     // 免得在同一根已经饱和的线路上继续加压、越限越死。
                     let quota = channels.reduce(0) { partial, channel in
@@ -782,6 +930,7 @@ final class DownloadEngine: @unchecked Sendable {
                                               attempt: 1,
                                               lastStatus: nil))
 
+                    limiter.noteDispatch()
                     active.increment()
                     assigned = true
                     let capturedChannels = channels
@@ -795,7 +944,9 @@ final class DownloadEngine: @unchecked Sendable {
                                        total: total,
                                        sink: sink,
                                        accumulator: accumulator,
-                                       board: board)
+                                       board: board,
+                                       watchdog: watchdog,
+                                       limiter: limiter)
                         board.remove(laneId)
                         // worker 自己结算并发名额：调度循环永远不需要
                         // 阻塞收割（group.next() 等一个 worker 干到退出
@@ -804,20 +955,30 @@ final class DownloadEngine: @unchecked Sendable {
                     }
                 }
 
-                // 2) 完成判定：所有 worker 都收工、且池子里再也切不出新活儿
+                // 2) 完成判定：所有 worker 都收工、且池子里再也切不出新活儿。
+                //
+                // 注意要把「正在退避的区间」算作「还有活儿」：否则一个失败片
+                // 正在退避、恰好所有 worker 都收工的那一刻，会被误判成完成而提前退出，
+                // 最后文件缺一块（下面的 size 校验会抛 incomplete，等于白下）。
                 if active.current == 0,
+                   pool.deferredCount() == 0,
                    nextWork(pool: pool, live: 0, lanes: lanes, total: total) == nil {
                     break
                 }
 
                 // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU。
-                // 这个分支每多睡一次，就是在「明明还能切分尾部、却白白空等」
-                // 的时间上加一笔；尾段小片几十 ms 就能跑完，窗口进一步收紧到 25ms
-                //（与安卓端一致，非尾段保持 60ms）。
+                // 如果只是「区间都在失败退避中」，等的时间要跟退避对齐，
+                // 否则会空转几十轮；其余情况按尾段/非尾段收紧窗口。
                 if !assigned {
-                    let tail = Self.isTailRemaining(remaining: max(total - pool.downloaded(), 0),
-                                                    lanes: lanes)
-                    try await Task.sleep(for: .milliseconds(tail ? 25 : 60))
+                    let deferred = pool.deferredCount()
+                    if deferred > 0 {
+                        // 退避中的片还没到期：睡到最近一片到期（封顶 250ms）
+                        try await Task.sleep(for: .milliseconds(120))
+                    } else {
+                        let tail = Self.isTailRemaining(remaining: max(total - pool.downloaded(), 0),
+                                                        lanes: lanes)
+                        try await Task.sleep(for: .milliseconds(tail ? 25 : 60))
+                    }
                 }
             }
             // 取消时把还在跑的子任务一起掐掉，别让它们继续占用连接
@@ -849,7 +1010,9 @@ final class DownloadEngine: @unchecked Sendable {
                           total: Int64,
                           sink: WriteSink,
                           accumulator: ProgressAccumulator,
-                          board: LaneBoard) async {
+                          board: LaneBoard,
+                          watchdog: StallWatchdog,
+                          limiter: AdaptiveConcurrency) async {
         var current = initial
 
         while !isCancelled {
@@ -901,15 +1064,19 @@ final class DownloadEngine: @unchecked Sendable {
                                                                         laneId: laneId,
                                                                         channel: channel,
                                                                         channels: channels,
+                                                                        limiter: limiter,
                                                                         tailIsolated: Self.isTailRemaining(remaining: remaining,
                                                                                                            lanes: lanes))
                 if !outcome.data.isEmpty {
                     sink.write(outcome.data, at: from)
                     pool.recordDone(Int64(outcome.data.count))
+                    watchdog.noteProgress(Int64(outcome.data.count))
                     await accumulator.advance(Int64(outcome.data.count))
                     winner.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
                     board.bumpDoneSlice()
                     board.reward(winner.name)
+                    // 顺畅通关：AIMD 加性增，窗口慢慢往上爬
+                    limiter.noteSuccess(speed: winner.measuredSpeed)
 
                     let seconds = max(outcome.elapsed, 0.001)
                     board.update(LaneSnapshot(laneId: laneId,
@@ -924,9 +1091,10 @@ final class DownloadEngine: @unchecked Sendable {
                                               lastStatus: 206))
                 }
                 if outcome.data.count < want {
-                    // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据
+                    // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据。
+                    // 带一点短退避，避免同一条坏连接立刻又把缺片捞回去。
                     let missing = Chunk(start: from + Int64(outcome.data.count), end: to)
-                    if missing.length > 0 { pool.putBack(missing) }
+                    if missing.length > 0 { pool.putBack(missing, backoff: 0.25) }
                 }
             } catch {
                 if isCancelled || Task.isCancelled { return }
@@ -936,6 +1104,12 @@ final class DownloadEngine: @unchecked Sendable {
                 // WriteSink.failed 只给磁盘写失败用：网络失败就标记的话，
                 // 后面所有 worker 写的数据都会被静默丢弃（upstream 的教训）。
                 // 失败预算耗尽才标记，调度循环的 90s 无进展保护也会兜底。
+                // 判断这片是不是因为服务端限流才失败的（限流要退避更久 + 砍 AIMD 窗口）
+                var isThrottled = false
+                if let downloadError = error as? DownloadError, case .throttled = downloadError {
+                    isThrottled = true
+                }
+
                 board.update(LaneSnapshot(laneId: laneId,
                                           routeName: channel.name,
                                           url: channel.current.absoluteString,
@@ -946,8 +1120,18 @@ final class DownloadEngine: @unchecked Sendable {
                                           state: .failed,
                                           attempt: Self.maxAttempts,
                                           lastStatus: { if case let .throttled(code, _) = (error as? DownloadError) { return code }; return nil }()))
-                // 失败的那一段必须还回池子，否则文件会缺一块
-                pool.putBack(Chunk(start: from, end: to))
+                // 失败的那一段必须还回池子，否则文件会缺一块。
+                //
+                // 关键：带退避还回，而不是插到队首让它立刻被重取 ——
+                // 老实现就是那样把自己憋成「限流时疯狂撞墙、下载卡死」的。
+                // 限流退避更久，并且顺手把 AIMD 窗口砍一刀。
+                let backoff: TimeInterval = isThrottled ? 1.2 : 0.4
+                pool.putBack(Chunk(start: from, end: to), backoff: backoff)
+                if isThrottled {
+                    limiter.noteThrottle()
+                } else {
+                    limiter.noteFailure()
+                }
                 if pool.failureCount() > Self.maxSliceFailures(lanes: lanes) {
                     sink.markFailed()
                 }
@@ -1086,12 +1270,15 @@ final class DownloadEngine: @unchecked Sendable {
                             laneId: Int,
                             channel: RouteChannel,
                             channels: [RouteChannel],
+                            limiter: AdaptiveConcurrency? = nil,
                             tailIsolated: Bool = false) async throws -> (SliceOutcome, RouteChannel, URL) {
         var lastError: Error = DownloadError.badResponse
         let direct = channels.first(where: { $0.name == DownloadRoute.direct.name })
         // 限流撞了两回就直接放弃这一片：继续退避 = 攥着区间干等，
         // 整条下载都陪着这条被限流的通道停摆。让位给调度器重新派。
         var throttledCount = 0
+        // 这一片已经试过的通道名：重试时优先换没试过的，避免在同一根坏线上反复撞
+        var tried: Set<String> = [channel.name]
 
         for attempt in 0..<Self.maxAttempts {
             // 每轮重试前先看有没有被取消
@@ -1111,17 +1298,22 @@ final class DownloadEngine: @unchecked Sendable {
                 } else {
                     // plan 里没有直连（如直连测速太慢被剔除）：用该通道自带的兜底（即直连 URL）。
                     // 此时成功不代表镜像恢复，见下面 `isFallback` 分支。
-                    active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name,
+                    active = channels[Self.pickRetryIndex(channels: channels, excluding: Array(tried),
                                                           excludeThrottled: tailIsolated)]
                     targetURL = active.fallback
                 }
             } else {
-                active = channels[Self.pickRetryIndex(channels: channels, excluding: channel.name,
+                active = channels[Self.pickRetryIndex(channels: channels, excluding: Array(tried),
                                                       excludeThrottled: tailIsolated)]
                 targetURL = active.primary
             }
+            tried.insert(active.name)
             // 兜底地址即直连：成功不清除镜像的限流标记，归因清晰。
             let isFallbackURL = targetURL != active.primary
+
+            // 每次真正发出 HTTP 请求都占一个速率闸名额（重试也算），
+            // 否则遇到 429 疯狂重试时速率闸形同虚设。
+            limiter?.noteDispatch()
 
             var request = URLRequest(url: targetURL)
             request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -1234,15 +1426,17 @@ final class DownloadEngine: @unchecked Sendable {
     /// 排除是为了“首失败即换线”：一直加权随机仍可能连抽同一条坏线，
     /// 白白浪费 `maxAttempts` 里宝贵的第二次机会。
     ///
+    /// - Parameter excluding: 本片已经试过的通道名，优先避开（全试过则退回普通加权）。
     /// - Parameter excludeThrottled: 尾段隔离时一并排除被限流通道（与安卓端一致）。
-    private static func pickRetryIndex(channels: [RouteChannel], excluding name: String,
+    private static func pickRetryIndex(channels: [RouteChannel], excluding names: [String],
                                        excludeThrottled: Bool = false) -> Int {
         guard channels.count > 1 else { return 0 }
+        let excluded = Set(names)
         var total: Double = 0
         var weights: [Double] = []
         weights.reserveCapacity(channels.count)
         for ch in channels {
-            if ch.name == name {
+            if excluded.contains(ch.name) {
                 weights.append(0)
                 continue
             }
@@ -1255,7 +1449,7 @@ final class DownloadEngine: @unchecked Sendable {
             weights.append(w)
             total += w
         }
-        // 被排除后无可用（同名通道占满，比如单通道复用）：退回普通加权
+        // 被排除后无可用（全试过了）：退回普通加权，至少还能兜底
         if total <= 0 {
             return DownloadEngine.pickWeightedIndex(channels: channels.map { ($0.measuredSpeed, $0.throttled) })
         }
@@ -1265,6 +1459,12 @@ final class DownloadEngine: @unchecked Sendable {
             if r <= 0 { return i }
         }
         return weights.indices.max(by: { weights[$0] < weights[$1] }) ?? 0
+    }
+
+    /// 重试选路（排除单条通道，旧签名，内部转调新实现）
+    private static func pickRetryIndex(channels: [RouteChannel], excluding name: String,
+                                       excludeThrottled: Bool = false) -> Int {
+        pickRetryIndex(channels: channels, excluding: [name], excludeThrottled: excludeThrottled)
     }
 
     /// 纯权重抽样（无排除），供重试回退路径复用，避免实例方法在 static 上下文里不可用。
@@ -1343,28 +1543,49 @@ final class DownloadEngine: @unchecked Sendable {
 
     // MARK: - 探测
 
-    private struct Probe {
+    private struct Probe: Sendable {
         let total: Int64
         let chunked: Bool
     }
 
     /// 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 + Content-Range 才确认支持分段），
-    /// 失败再退回 HEAD。逐条通道尝试，任何一条成功即可。
+    /// 失败再退回 HEAD。**并发**打所有通道，谁先给出确定答案就用谁的 ——
+    /// 老实现是逐条串行，第一条是死镜像时就得白等 15s 超时，这正是「开始下载慢」的一段。
+    ///
+    /// - Returns: 已探明分段能力的结果用 `Probe`；只探到体积（HEAD 兜底）的用 `fallback`。
     private func probeSize(urls: [URL]) async throws -> Probe? {
-        var headFallback: Int64?
-        for url in urls {
-            guard let probe = await probeSize(url: url) else { continue }
-            if probe.chunked, probe.total > 0 { return probe }
-            if headFallback == nil, probe.total > 0 { headFallback = probe.total }
+        guard !urls.isEmpty else { return nil }
+        // 并发探测，取第一个「已确认分段」的结果；没有就用第一个「有体积」的结果兜底
+        let results = await withTaskGroup(of: (index: Int, probe: Probe?).self) { group -> [(Int, Probe?)] in
+            for (index, url) in urls.enumerated() {
+                group.addTask { [self] in (index, await self.probeSize(url: url)) }
+            }
+            var collected: [(Int, Probe?)] = []
+            for await item in group { collected.append(item) }
+            return collected
         }
-        return headFallback.map { Probe(total: $0, chunked: false) }
+
+        // 优先：确认支持分段的（chunked == true），取 index 最小的
+        let chunked = results
+            .filter { $0.1?.chunked == true && ($0.1?.total ?? 0) > 0 }
+            .sorted { $0.0 < $1.0 }
+            .first?.1
+        if let chunked { return chunked }
+
+        // 兜底：有体积但没确认分段（HEAD 探到的）
+        let fallback = results
+            .compactMap { $0.1 }
+            .first { $0.total > 0 }
+        return fallback.map { Probe(total: $0.total, chunked: false) }
     }
 
     private func probeSize(url: URL) async -> Probe? {
         if isCancelled { return nil }
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 20
+        // 探测超时收紧到 8s：探测只该花一个 RTT，超过就说明这条通道不行，
+        // 让别的通道先出结果，而不是把整段下载卡在这一条上。
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 12
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
@@ -1425,8 +1646,15 @@ final class DownloadEngine: @unchecked Sendable {
         max(20, lanes * 2)
     }
 
-    /// 引擎并发上限（与 AccelerationSettings.maxConnections 一致）
+    /// 引擎并发上限（与 AccelerationSettings.maxConnections 一致）。
+    /// 注意这只是**上限**：真正的在飞并发由 AdaptiveConcurrency 的 AIMD 窗口决定，
+    /// 服务器撑不住时引擎会自己降下来，不会再出现「128 条连接一起撞限流」。
     private static let maxLanes = 128
+
+    /// 卡住看门狗窗口（秒）：有连接在飞、但超过这个时间一个字节都没落盘，
+    /// 就判定卡住并强制重建所有在飞连接。CDN 的心跳字节会让 URLSession
+    /// 的 idle 超时永不触发，所以必须用「有没有真的写进文件」来判。
+    private static let stallWindow: TimeInterval = 12
 
     /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
     /// 并发放开到 128+ 之后，默认 soft limit（常见 256）会在建连一半时报
@@ -1448,16 +1676,9 @@ final class DownloadEngine: @unchecked Sendable {
         #endif
     }
 
-    /// 渐进建连：每档放开多少条并发。
-    ///
-    /// 爬坡的目的是避开「起步瞬间几百个请求同时砸过去 → 503 ServerBusy」，
-    /// 但步子太小会白白浪费前几秒带宽。16 是 64 并发下的平衡点。
-    ///
-    /// 极限档（128/256/512）如果仍按 16/档，爬满要 4.8s，起步太肉 ——
-    /// 所以按 lanes/8 取步长：512 → 64/档 → 8 档 ≈ 1.2s；64 及以下仍是 16/档。
-    private static func rampStep(for lanes: Int) -> Int { max(16, lanes / 8) }
-    /// 渐进建连：每档之间间隔多久（配合 rampStep 决定爬坡总时长）
-    private static let connectionRampInterval: TimeInterval = 0.15
+    /// 渐进建连的策略已由 `AdaptiveConcurrency`（AIMD 窗口）接管：
+    /// 起始窗口 16，顺畅时加性增、限流时乘性减，不再需要时间片式的固定爬坡。
+    /// 这里保留常量说明，方便对照旧行为。
 
     private static func retryAfter(_ http: HTTPURLResponse) -> TimeInterval? {
         guard let raw = http.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces),
@@ -1466,8 +1687,10 @@ final class DownloadEngine: @unchecked Sendable {
     }
 
     /// 指数退避 + 抖动；限流时优先听服务端的 Retry-After。
+    ///
     /// 限流退避上限压到 1.5s：worker 命中限流后要么很快回来、要么直接让位，
     /// 绝不攥着区间长睡 —— 一次 Retry-After: 600 的限流不该让整条下载停十分钟。
+    /// 真正的「降温」交给 AdaptiveConcurrency 砍窗口，不靠单条 worker 睡觉。
     private static func backoffMillis(attempt: Int, error: Error) -> Int {
         if case .throttled(_, let retryAfter) = (error as? DownloadError) {
             // 防雪崩：多个 worker 同时被限流时把退避时间错开
@@ -1592,6 +1815,19 @@ private final class TaskRegistry: @unchecked Sendable {
     func cancelAll() {
         lock.lock()
         cancelling = true
+        let live = Array(tasks.values)
+        tasks.removeAll()
+        lock.unlock()
+        live.forEach { $0.cancel() }
+    }
+
+    /// 「掐掉这一批、但别把整个下载判死」：卡住恢复用。
+    ///
+    /// 与 `cancelAll` 的区别是不会把 `cancelling` 打开 —— 被掐掉的 worker
+    /// 会以取消错误退出，调度循环看到 `isCancelled` 仍为 false，
+    /// 于是下一轮就用新连接重新派活，下载继续。
+    func abortAll() {
+        lock.lock()
         let live = Array(tasks.values)
         tasks.removeAll()
         lock.unlock()

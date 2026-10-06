@@ -109,9 +109,10 @@ struct AccelerationSettings {
     var customPrefix: String = ""
 
     static let `default` = AccelerationSettings()
-    /// 设置页档位
-    /// 128 属于极限档：吃千兆内网/高速 Wi-Fi 用，普通宽带吃不满，
-    /// 且更容易被 CDN 限流（引擎会自动退让，不会失败）。
+    /// 设置页档位。
+    /// 注意这是**上限**而不是「目标连接数」：引擎用 AIMD 自适应窗口自己决定
+    /// 当前实际开多少条连接（服务器撑得住才往上爬，一遇限流立刻减半）。
+    /// 所以设 128 不会像以前那样盲目砸 128 条连接撞限流，只会给引擎更高的天花板。
     static let connectionOptions = [8, 16, 32, 64, 128]
     /// 引擎接受的并发上限
     static let maxConnections = 128
