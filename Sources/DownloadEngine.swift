@@ -88,6 +88,9 @@ enum DownloadError: LocalizedError, Equatable {
     case badResponse
     case cancelled
     case incomplete
+    /// 下载完成但**字节覆盖校验**没过：有区间缺口或重复写入。
+    /// 带上账本给出的差异描述，方便定位（而不是只说一句「校验不通过」）。
+    case incompleteDetailed(String)
     /// 服务器忽略 Range 头（回 200 全量）：这条地址不能用于分段下载
     case noRangeSupport
     /// 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避
@@ -98,6 +101,8 @@ enum DownloadError: LocalizedError, Equatable {
         case .badResponse: return "下载失败：服务器响应异常"
         case .cancelled: return "下载已取消"
         case .incomplete: return "下载失败：数据校验不通过（可能断流），请重试"
+        case .incompleteDetailed(let detail):
+            return "下载失败：文件字节校验不通过（\(detail)），请重试"
         case .noRangeSupport: return "下载失败：该通道不支持分段下载"
         case .throttled(let code, _): return "下载失败：服务器限流（\(code)）"
         }
@@ -108,6 +113,8 @@ enum DownloadError: LocalizedError, Equatable {
         case (.badResponse, .badResponse), (.cancelled, .cancelled), (.incomplete, .incomplete),
              (.noRangeSupport, .noRangeSupport):
             return true
+        case let (.incompleteDetailed(a), .incompleteDetailed(b)):
+            return a == b
         case let (.throttled(a, _), .throttled(b, _)):
             return a == b
         default:
@@ -176,6 +183,14 @@ private final class SlicePool: @unchecked Sendable {
 
     func recordFailure() {
         lock.lock(); failures += 1; lock.unlock()
+    }
+
+    /// 重置失败计数（缺口修复轮开始前调用）。
+    ///
+    /// 主循环可能已经因为连续失败攒满预算；不重置的话，补漏这一轮
+    /// 第一次失败就会直接掀桌 —— 而补漏恰恰最需要「允许零星失败」。
+    func resetFailures() {
+        lock.lock(); failures = 0; lock.unlock()
     }
 
     func failureCount() -> Int {
@@ -790,8 +805,14 @@ final class DownloadEngine: @unchecked Sendable {
         var sessions: [URLSession] = []
         for _ in 0..<sessionCount {
             let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 60
-            config.timeoutIntervalForResource = 3600
+            // **关键**：`timeoutIntervalForRequest` 是 **idle 超时** —— 它按
+            // 「两次收到数据之间的间隔」计时，而 CDN 的心跳字节会不断重置它，
+            // 结果就是「看着在动、实际一动不动」的连接永远不超时。
+            // 以前设 60s，配合 3600s 的资源总时长，一条挂住的连接能占着
+            // 一条 lane 一小时。现在收紧到 20s，并靠 StallWatchdog + 单片
+            // 总时长上限双重兜底，最坏情况也只是丢掉这一片、换线重试。
+            config.timeoutIntervalForRequest = 20
+            config.timeoutIntervalForResource = 1800
             config.httpMaximumConnectionsPerHost = perSessionLimit
             sessions.append(URLSession(configuration: config))
         }
@@ -829,6 +850,10 @@ final class DownloadEngine: @unchecked Sendable {
 
         let pool = SlicePool(total: total)
         let sink = WriteSink(handle: handle)
+        // 覆盖账本：记录「哪些字节真的被写进文件了」。
+        // 以前收尾只校验 size == total（总量），而「重复写一段 + 漏写一段」
+        // 的总量可能相等 —— 文件大小对、内容错，症状就是「能下完但解压不了」。
+        let ledger = WriteLedger(total: total)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             // 并发计数：worker 结束时自己递减（见 addTask 闭包尾部）。
@@ -943,6 +968,7 @@ final class DownloadEngine: @unchecked Sendable {
                                        lanes: lanes,
                                        total: total,
                                        sink: sink,
+                                       ledger: ledger,
                                        accumulator: accumulator,
                                        board: board,
                                        watchdog: watchdog,
@@ -988,10 +1014,90 @@ final class DownloadEngine: @unchecked Sendable {
         if isCancelled { throw DownloadError.cancelled }
         if sink.failed { throw DownloadError.incomplete }
 
+        // 完整性校验：不只是「文件大小对」，而是「每个字节恰好被写过一次」。
+        //
+        // 老实现只有 size == total 这一句，而总量相等并不能保证内容正确
+        //（重复写一段 + 漏写一段，总量照样相等）——
+        // 症状就是「能下完但解压不了」。
+        //
+        // 不过「校验不过就直接判死」有点粗暴：多数情况下只是个别区间因为
+        // 连接抖动没落盘。这里补一轮**缺口修复** —— 把账本里还没覆盖的区间
+        // 重新塞回池子再下一次，能救回来的就不该让用户重下几百 MB。
+        var repairRound = 0
+        while !ledger.isComplete() && repairRound < Self.maxRepairRounds {
+            if isCancelled { throw DownloadError.cancelled }
+            let gaps = ledger.gaps(limit: Self.maxRepairRanges)
+            if gaps.isEmpty { break }
+            repairRound += 1
+            board.stalled = false
+            // 重置失败计数：上一轮主循环可能已经攒满失败预算，
+            // 不重置的话这一轮补漏的第一次失败就会直接掀桌。
+            pool.resetFailures()
+
+            gaps.forEach { gap in
+                pool.putBack(Chunk(start: gap.lowerBound, end: gap.upperBound))
+            }
+
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                let repairActive = ConcurrencyCounter()
+                let repairLimiter = AdaptiveConcurrency(ceiling: min(lanes, 32))
+                let repairWatchdog = StallWatchdog(stallWindow: Self.stallWindow)
+                var repairRoundRobin = 0
+                var lastGapBytes = ledger.coveredBytes
+                var lastGapAt = Date()
+
+                while true {
+                    if isCancelled || inflight.isCancelling { break }
+
+                    let coveredNow = ledger.coveredBytes
+                    if coveredNow != lastGapBytes {
+                        lastGapBytes = coveredNow
+                        lastGapAt = Date()
+                    } else if repairActive.current > 0,
+                              Date().timeIntervalSince(lastGapAt) > 30 {
+                        break   // 这一轮补漏没有进展，交给下一轮或最终报错
+                    }
+
+                    var dispatched = false
+                    while repairActive.current < repairLimiter.currentWindow,
+                          repairLimiter.canDispatch(inflight: repairActive.current) {
+                        guard let work = pool.take() else { break }
+                        let channel = channels[repairRoundRobin % channels.count]
+                        repairRoundRobin += 1
+                        repairLimiter.noteDispatch()
+                        repairActive.increment()
+                        dispatched = true
+                        group.addTask { [self] in
+                            await runSlice(laneId: 0,
+                                           channel: channel,
+                                           channels: channels,
+                                           initial: work,
+                                           pool: pool,
+                                           lanes: min(lanes, 32),
+                                           total: total,
+                                           sink: sink,
+                                           ledger: ledger,
+                                           accumulator: accumulator,
+                                           board: board,
+                                           watchdog: repairWatchdog,
+                                           limiter: repairLimiter)
+                            repairActive.decrement()
+                        }
+                    }
+
+                    if repairActive.current == 0 && pool.backlog == 0 { break }
+                    if !dispatched {
+                        try await Task.sleep(for: .milliseconds(repairActive.current == 0 ? 100 : 60))
+                    }
+                }
+                group.cancelAll()
+            }
+        }
+
         let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
-        guard size == total else {
+        guard size == total, ledger.isComplete() else {
             try? fm.removeItem(at: outURL)
-            throw DownloadError.incomplete
+            throw DownloadError.incompleteDetailed(ledger.describe())
         }
         await accumulator.finish(downloaded: total)
         return outURL
@@ -1009,6 +1115,7 @@ final class DownloadEngine: @unchecked Sendable {
                           lanes: Int,
                           total: Int64,
                           sink: WriteSink,
+                          ledger: WriteLedger,
                           accumulator: ProgressAccumulator,
                           board: LaneBoard,
                           watchdog: StallWatchdog,
@@ -1069,9 +1176,14 @@ final class DownloadEngine: @unchecked Sendable {
                                                                                                            lanes: lanes))
                 if !outcome.data.isEmpty {
                     sink.write(outcome.data, at: from)
-                    pool.recordDone(Int64(outcome.data.count))
+                    // 登记覆盖区间：只有**真的写进文件**的字节才算数。
+                    // 账本会在这里发现重复写入（overlaps > 0），收尾校验据此判死；
+                    // 进度也按「新覆盖的字节」推进，重复写入不虚涨。
+                    let newlyCovered = ledger.record(start: from,
+                                                     endInclusive: from + Int64(outcome.data.count) - 1)
+                    pool.recordDone(newlyCovered)
                     watchdog.noteProgress(Int64(outcome.data.count))
-                    await accumulator.advance(Int64(outcome.data.count))
+                    await accumulator.advance(newlyCovered)
                     winner.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
                     board.bumpDoneSlice()
                     board.reward(winner.name)
@@ -1343,6 +1455,17 @@ final class DownloadEngine: @unchecked Sendable {
 
                 switch http.statusCode {
                 case 206:
+                    // **关键校验**：确认服务器真的按我们请求的区间返回。
+                    //
+                    // 有些镜像/CDN 对 Range 支持不完整（忽略部分区间、或从自己
+                    // 理解的偏移开始返回），返回码仍是 206。不校验 Content-Range
+                    // 的话，取到的数据会被写到错误偏移上 —— 下载"成功"、文件大小
+                    // 也对，但内容错了，表现就是「能下完但解压不了」。
+                    guard Self.contentRangeMatches(http,
+                                                   expectedStart: chunk.start,
+                                                   expectedEnd: chunk.end) else {
+                        throw DownloadError.noRangeSupport
+                    }
                     // 兜底（直连）成功不代表镜像恢复，不清除镜像限流标记
                     if !isFallbackURL { active.setThrottled(false) }
                     guard !data.isEmpty else { throw DownloadError.incomplete }
@@ -1419,6 +1542,50 @@ final class DownloadEngine: @unchecked Sendable {
 
         pool.recordFailure()
         throw lastError
+    }
+
+    /// 校验 `Content-Range` 是否真的对应我们请求的字节区间。
+    ///
+    /// 形如 `bytes 4194304-8388607/10485760`。
+    ///
+    /// 两道检查：
+    ///  1. 起止偏移必须与请求完全一致 —— 防止镜像「自作主张」返回别的区间
+    ///     （返回码仍是 206），那种数据写到当前偏移就是静默损坏；
+    ///  2. 总长度（`/` 后面那段）应当大于我们请求的终点 —— 防止下载过程中
+    ///     源端文件被替换（GitHub 上很少见，但镜像缓存错乱时会遇到）。
+    ///
+    /// 拿不到头时返回 false：宁可换一条通道重试，也不冒险写错位置。
+    private static func contentRangeMatches(_ http: HTTPURLResponse,
+                                            expectedStart: Int64,
+                                            expectedEnd: Int64) -> Bool {
+        guard let raw = http.value(forHTTPHeaderField: "Content-Range")?.trimmingCharacters(in: .whitespaces),
+              !raw.isEmpty else { return false }
+
+        // 期望格式：bytes <start>-<end>/<total>（total 也可能是 *）
+        var spec = raw
+        if spec.lowercased().hasPrefix("bytes") {
+            spec = String(spec.dropFirst("bytes".count))
+        }
+        spec = spec.trimmingCharacters(in: .whitespaces)
+        if spec.hasPrefix("=") { spec = String(spec.dropFirst()).trimmingCharacters(in: .whitespaces) }
+        guard !spec.isEmpty else { return false }
+
+        let parts = spec.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        let rangePart = String(parts[0]).trimmingCharacters(in: .whitespaces)
+        let dashParts = rangePart.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard dashParts.count == 2,
+              let start = Int64(dashParts[0].trimmingCharacters(in: .whitespaces)),
+              let end = Int64(dashParts[1].trimmingCharacters(in: .whitespaces)) else { return false }
+
+        guard start == expectedStart, end == expectedEnd else { return false }
+
+        if parts.count == 2 {
+            let totalPart = String(parts[1]).trimmingCharacters(in: .whitespaces)
+            if totalPart != "*" {
+                guard let total = Int64(totalPart), total > expectedEnd else { return false }
+            }
+        }
+        return true
     }
 
     /// 重试选路：加权随机，但排除刚失败的那条线（单通道时无处可避，直接返回 0）。
@@ -1538,6 +1705,20 @@ final class DownloadEngine: @unchecked Sendable {
         try? fm.removeItem(at: outURL)
         try fm.moveItem(at: tempURL, to: outURL)
         let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
+
+        // **关键校验**：单连接路径以前从不检查「到底下完了没有」——
+        // 连接中途断流时 URLSession 可能安静返回一个截断的文件，
+        // 却照样报告「下载完成」。解压时才发现文件不完整。
+        // 这里比对服务端声明的 Content-Length。
+        if let declared = http.value(forHTTPHeaderField: "Content-Length"),
+           let expected = Int64(declared), expected > 0, size != expected {
+            try? fm.removeItem(at: outURL)
+            throw DownloadError.incompleteDetailed("单连接下载被截断：只收到 \(size) / \(expected) 字节")
+        }
+        guard size > 0 else {
+            try? fm.removeItem(at: outURL)
+            throw DownloadError.incomplete
+        }
         return (outURL, size, 1)
     }
 
@@ -1654,7 +1835,20 @@ final class DownloadEngine: @unchecked Sendable {
     /// 卡住看门狗窗口（秒）：有连接在飞、但超过这个时间一个字节都没落盘，
     /// 就判定卡住并强制重建所有在飞连接。CDN 的心跳字节会让 URLSession
     /// 的 idle 超时永不触发，所以必须用「有没有真的写进文件」来判。
-    private static let stallWindow: TimeInterval = 12
+    ///
+    /// 从 12s 收紧到 8s：每个分片请求现在都有总时长上限兜底，
+    /// 8 秒没有任何字节落盘已经能确定是卡住，再等下去只是白白占着连接。
+    private static let stallWindow: TimeInterval = 8
+
+    /// 缺口修复的最大轮数。
+    ///
+    /// 主循环跑完后若账本显示还有没覆盖的字节，就把缺口重新派下去再跑一轮。
+    /// 3 轮足够吃掉「个别区间因连接抖动没落盘」这类问题；
+    /// 若 3 轮还补不上，多半是源端真有问题，继续重试只是浪费用户时间。
+    private static let maxRepairRounds = 3
+
+    /// 单轮修复最多处理多少个缺口区间（防止极端碎片化时爆炸）
+    private static let maxRepairRanges = 512
 
     /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
     /// 并发放开到 128+ 之后，默认 soft limit（常见 256）会在建连一半时报
