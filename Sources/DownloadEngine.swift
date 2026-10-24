@@ -1771,7 +1771,7 @@ final class DownloadEngine: @unchecked Sendable {
 
     private func probeSize(url: URL) async -> Probe? {
         if isCancelled { return nil }
-        val config = URLSessionConfiguration.ephemeral
+        let config = URLSessionConfiguration.ephemeral
         // 探测超时收紧到 3s。探测只是发一个 `Range: bytes=0-0`（拿体积），
         // 正常情况一个 RTT 就回来了；8s 会让「所有通道都慢」时白白卡住很久 ——
         // 大文件用户对这个特别敏感（「解析下载地址很慢」的体感来源之一）。
