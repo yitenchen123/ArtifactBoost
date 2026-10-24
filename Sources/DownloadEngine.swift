@@ -1,5 +1,4 @@
 import Foundation
-import os   // os_proc_available_memory()：按可用内存限制并发用
 
 struct DownloadProgress: Equatable {
     var downloadedBytes: Int64 = 0
@@ -1895,18 +1894,16 @@ final class DownloadEngine: @unchecked Sendable {
     }
 
     /// 估算可用内存字节数（只敢用一半，另一半留给系统与框架）。
+    ///
+    /// 这里刻意**不**用 `os_proc_available_memory()`：
+    /// 它在 iOS 模拟器上不可用，而 CI 会同时构建真机与模拟器两个目标，
+    /// 用了会让模拟器构建直接编译失败。
+    /// 改用「物理内存的 1/8」作为保守估计 —— 对主流 iPhone 足够安全
+    ///（3GB 设备的 1/8 = 384MB，配 1MB 分片能撑满 128 并发上限）。
     private static func usableMemoryBytes() -> Int64 {
-        // 用 os_proc_available_memory（iOS 13+）：它给的是「本进程还剩多少可用」，
-        // 比 phys_footprint 更贴近真实情况。
-        var available: Int64 = 0
-        if #available(iOS 13.0, *) {
-            available = Int64(os_proc_available_memory())
-        }
-        if available <= 0 {
-            // 退回系统物理内存的 1/8 作为粗估（保守）
-            available = Int64(ProcessInfo.processInfo.physicalMemory / 8)
-        }
-        return available / 2
+        let physical = Int64(ProcessInfo.processInfo.physicalMemory)
+        guard physical > 0 else { return 0 }
+        return physical / 8
     }
 
     /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
