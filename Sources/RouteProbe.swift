@@ -37,6 +37,13 @@ final class RouteProbeCache: @unchecked Sendable {
     /// 探测时只拉一小段，够判断连通性和粗测速度就行
     private let probeBytes = 32 * 1024
 
+    /// 整轮探测的总预算（秒）。
+    ///
+    /// 探测的**目的是让下载更快开始**，不能反过来变成「先卡两秒」。
+    /// 到点就用已经回来的结果做排序，没回来的当不可用处理。
+    /// 1.2s 大约是一次跨洋 RTT 的 3~5 倍，足够大多数镜像应答。
+    private static let totalBudget: TimeInterval = 1.2
+
     func cached(for host: String) -> [RouteProbe]? {
         lock.lock(); defer { lock.unlock() }
         guard let entry = entries[host] else { return nil }
@@ -75,6 +82,8 @@ final class RouteProbeCache: @unchecked Sendable {
         var results: [RouteProbe] = []
         results.reserveCapacity(routes.count)
 
+        // **总预算**：探测的目的是让下载更快开始，不能反过来变成「先卡两秒」。
+        // 到点就把还没回来的通道取消掉，用已经返回的结果排序。
         await withTaskGroup(of: RouteProbe.self) { group in
             for (index, route) in routes.enumerated() {
                 let url = routeURLs[index]
@@ -83,8 +92,18 @@ final class RouteProbeCache: @unchecked Sendable {
                                                    bytes: bytes, timeout: limit)
                 }
             }
-            for await probe in group { results.append(probe) }
+            let deadline = Date().addingTimeInterval(Self.totalBudget)
+            for await probe in group {
+                results.append(probe)
+                if Date() >= deadline {
+                    // 预算用完：不再等剩下的，直接取消
+                    group.cancelAll()
+                    break
+                }
+            }
         }
+
+        guard !results.isEmpty else { return [] }
 
         return results.sorted { lhs, rhs in
             if lhs.ok != rhs.ok { return lhs.ok }

@@ -1,4 +1,5 @@
 import Foundation
+import os   // os_proc_available_memory()：按可用内存限制并发用
 
 struct DownloadProgress: Equatable {
     var downloadedBytes: Int64 = 0
@@ -722,7 +723,16 @@ final class DownloadEngine: @unchecked Sendable {
         // 否则默认值（常见 256）会在建连一半时报 too many open files。
         Self.raiseFileLimit()
 
-        let lanes = max(1, min(connections, Self.maxLanes))
+        // **按可用内存限制并发**（大文件的关键修复）。
+        //
+        // 每个 worker 处理分片时会把整片读进内存，分片上限是 maxSliceTarget。
+        // 以前直接按用户设的 128 并发跑 —— 128 × 4MB = 512MB 的瞬时峰值，
+        // iOS 上会被系统直接杀掉（用户看到的就是「大文件完全下不动」）。
+        //
+        // 现在先按「当前可用内存 / 单片大小」算出安全并发，再与用户设的上限取小。
+        let requestedLanes = max(1, min(connections, Self.maxLanes))
+        let lanes = Self.safeLanes(requested: requestedLanes,
+                                   bytesPerLane: Int(Self.maxSliceTarget))
 
         // 先探测体积 + 确认服务器是否真的支持 Range
         let probe = allowChunking ? try await probeSize(urls: urls) : nil
@@ -1762,11 +1772,13 @@ final class DownloadEngine: @unchecked Sendable {
 
     private func probeSize(url: URL) async -> Probe? {
         if isCancelled { return nil }
-        let config = URLSessionConfiguration.ephemeral
-        // 探测超时收紧到 8s：探测只该花一个 RTT，超过就说明这条通道不行，
-        // 让别的通道先出结果，而不是把整段下载卡在这一条上。
-        config.timeoutIntervalForRequest = 8
-        config.timeoutIntervalForResource = 12
+        val config = URLSessionConfiguration.ephemeral
+        // 探测超时收紧到 3s。探测只是发一个 `Range: bytes=0-0`（拿体积），
+        // 正常情况一个 RTT 就回来了；8s 会让「所有通道都慢」时白白卡住很久 ——
+        // 大文件用户对这个特别敏感（「解析下载地址很慢」的体感来源之一）。
+        // 三条通道并发，取最先回来的那条，3s 已经足够。
+        config.timeoutIntervalForRequest = 3
+        config.timeoutIntervalForResource = 5
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
@@ -1812,7 +1824,16 @@ final class DownloadEngine: @unchecked Sendable {
     /// 最后那几 MB 只能被一两条连接瓜分，速度会「断崖式」掉下去。
     /// 64KB 让尾段能摊给更多连接，末段也能贴着带宽跑完。
     private static let minSliceTarget: Int64 = 64 * 1024
-    private static let maxSliceTarget: Int64 = 4 * 1024 * 1024
+    /// 分片大小上限：从 4MB 降到 1MB —— 这是**大文件能否正常下载**的关键。
+    ///
+    /// 每个 worker 在处理分片时会把整个分片读进内存，
+    /// 所以分片上限直接决定「每条连接吃多少内存」：
+    ///   4MB × 128 并发 = 512MB  → iOS 上直接被杀进程
+    ///   1MB × 128 并发 = 128MB  → 安全
+    ///
+    /// 1MB 片在 100MB+ 的文件上依然只占 1% 的分片数量，
+    /// 不会因为请求变多而明显拖慢速度（RTT 摊薄在 1MB 上已经足够）。
+    private static let maxSliceTarget: Int64 = 1 * 1024 * 1024
     /// 小于这个体积不做分段：切来切去不如一条连接拉完
     private static let minChunkedTotal: Int64 = 4 * 1024 * 1024
     private static let singleProbeBytes: Int64 = 64 * 1024
@@ -1849,6 +1870,44 @@ final class DownloadEngine: @unchecked Sendable {
 
     /// 单轮修复最多处理多少个缺口区间（防止极端碎片化时爆炸）
     private static let maxRepairRanges = 512
+
+    /// 按可用内存约束并发数。
+    ///
+    /// 分段下载里每个 worker 都会把一个分片整个放进内存，分片上限是
+    /// `maxSliceTarget`（1MB）。用户把并发设到 128 时：
+    ///
+    ///     128 × 1MB = 128MB 缓冲
+    ///
+    /// 加上 URLSession 自身的缓冲与已分配的堆，低内存设备上依然可能紧张。
+    /// 这里按「当前可用内存 / 每条连接预算」算出安全并发，再与用户设的上限取小。
+    /// 宁可少开几条连接（速度略降），也不能让整个下载被杀。
+    private static func safeLanes(requested: Int, bytesPerLane: Int) -> Int {
+        // 再省也得留 2 条连接，否则等于退化成单线程
+        let minLanes = 2
+        guard requested > minLanes else { return max(requested, 1) }
+
+        let available = usableMemoryBytes()
+        guard available > 0 else { return requested }
+
+        let perLane = max(Int64(bytesPerLane), 1)
+        let byMemory = Int(available / perLane)
+        return min(max(byMemory, minLanes), requested)
+    }
+
+    /// 估算可用内存字节数（只敢用一半，另一半留给系统与框架）。
+    private static func usableMemoryBytes() -> Int64 {
+        // 用 os_proc_available_memory（iOS 13+）：它给的是「本进程还剩多少可用」，
+        // 比 phys_footprint 更贴近真实情况。
+        var available: Int64 = 0
+        if #available(iOS 13.0, *) {
+            available = Int64(os_proc_available_memory())
+        }
+        if available <= 0 {
+            // 退回系统物理内存的 1/8 作为粗估（保守）
+            available = Int64(ProcessInfo.processInfo.physicalMemory / 8)
+        }
+        return available / 2
+    }
 
     /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
     /// 并发放开到 128+ 之后，默认 soft limit（常见 256）会在建连一半时报
