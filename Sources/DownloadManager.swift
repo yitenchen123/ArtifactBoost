@@ -7,6 +7,8 @@ final class DownloadManager: ObservableObject {
         case idle
         case resolving
         case downloading(DownloadProgress)
+        /// 用户主动暂停：半成品与续传账本都保留，点「继续」从断点接着下
+        case paused(DownloadProgress)
         case finished(URL)
         case failed(String)
     }
@@ -16,6 +18,8 @@ final class DownloadManager: ObservableObject {
     @Published var routeSummary: [String: String] = [:]
     @Published private(set) var order: [String] = []
     @Published private(set) var items: [String: DownloadItem] = [:]
+    /// 最近一帧进度：暂停时用它渲染「已下 X%，点继续接着下」
+    @Published private(set) var lastProgress: [String: DownloadProgress] = [:]
 
     private var engines: [String: DownloadEngine] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
@@ -46,7 +50,6 @@ final class DownloadManager: ObservableObject {
             return false
         }.count
     }
-
     var orderedItems: [DownloadItem] {
         order.compactMap { items[$0] }
     }
@@ -79,8 +82,9 @@ final class DownloadManager: ObservableObject {
         let onProgress: @Sendable (DownloadProgress) -> Void = { [weak self] progress in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.lastProgress[itemID] = progress
                 switch self.states[itemID] {
-                case .resolving?, .downloading?, .none:
+                case .resolving?, .downloading?, .paused?, .none:
                     self.states[itemID] = .downloading(progress)
                 default:
                     break
@@ -96,11 +100,18 @@ final class DownloadManager: ObservableObject {
                                                     settings: settings,
                                                     onProgress: onProgress)
                 states[item.id] = .finished(url)
+                lastProgress[item.id] = nil
                 // 下完了：清掉落盘记录，避免重启后复活
                 taskStore.remove(id: item.id)
             } catch {
                 if Self.isCancellation(error) {
-                    states[item.id] = .idle
+                    // 取消有两种：用户点了暂停（状态已由 pause 设好，别覆盖），
+                    // 以及用户点了取消（pause 之外的分支）。这里只在还是「下载中」时回 idle。
+                    if case .paused? = states[item.id] {
+                        // 暂停状态保持不动
+                    } else {
+                        states[item.id] = .idle
+                    }
                 } else {
                     states[item.id] = .failed(error.localizedDescription)
                     // 失败不自动续下：清记录，用户手动重试时会重新落盘
@@ -111,6 +122,23 @@ final class DownloadManager: ObservableObject {
             tasks[item.id] = nil
             endBackgroundTask(for: item.id)
         }
+    }
+
+    /// 暂停：掐断连接但**保留**半成品与续传账本，点「继续」从断点接着下。
+    ///
+    /// 与 `cancel` 的区别就在这里 —— 取消是「我不要了」（连同半成品一起删），
+    /// 暂停是「等会儿再下」（几百 MB 不能白下）。
+    func pause(_ item: DownloadItem) {
+        guard engines[item.id] != nil else { return }
+        let snapshot = lastProgress[item.id] ?? DownloadProgress()
+        states[item.id] = .paused(snapshot)
+        engines[item.id]?.cancel()
+        tasks[item.id]?.cancel()
+        tasks[item.id] = nil
+        engines[item.id] = nil
+        endBackgroundTask(for: item.id)
+        // 任务记录保留：进程重启后仍能自动续上
+        routeSummary[item.id] = nil
     }
 
     /// 取消下载。
@@ -125,8 +153,10 @@ final class DownloadManager: ObservableObject {
         tasks[item.id] = nil
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
-        // 用户主动取消：清记录，不恢复
+        // 用户主动取消：连同半成品一起清掉，不恢复
         taskStore.remove(id: item.id)
+        ResumeStore.shared.discard(key: item.id)
+        lastProgress[item.id] = nil
         states[item.id] = .idle
     }
 
@@ -137,6 +167,8 @@ final class DownloadManager: ObservableObject {
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
         taskStore.remove(id: item.id)
+        ResumeStore.shared.discard(key: item.id)
+        lastProgress[item.id] = nil
         states[item.id] = nil
         routeSummary[item.id] = nil
         items[item.id] = nil
@@ -173,137 +205,81 @@ final class DownloadManager: ObservableObject {
 
     // MARK: - 下载主流程
 
-    /// 解析签名地址单次限时 30s（与安卓端同步），重试前退避 1.5s
-    static let resolveTimeout: TimeInterval = 30
-    static let resolveRetryDelay: TimeInterval = 1.5
-
-    /// 解析签名地址 → 选通道 → 下载。签名地址有时效，整体失败后重新解析再试一次。
+    /// IDM 式的下载流程：**没有「解析地址」这一阶段**。
     ///
-    /// 解析阶段永远直连 api.github.com（通道只影响下载阶段），弱网下单次可达 30s；
-    /// 这里做了三件事避免“一直转”：单次 30s 限时、重试前退避 1.5s、重试时刷出明确文案。
+    /// 第一个带 Range 的请求直接打到「github.com 稳定地址 / codeload / api.github.com」，
+    /// 由引擎在同一个往返里完成：跟随 302 拿到签名地址、读出文件体积、拿回首块数据。
+    /// 用户点下去到出速度只差一个 RTT，而不是老实现那样排四段队。
     private func performDownload(item: DownloadItem,
                                  client: GitHubClient,
                                  engine: DownloadEngine,
                                  settings: AccelerationSettings,
                                  onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
+        let request = try makeRequest(item: item, client: client, settings: settings)
+
         var lastError: Error = DownloadError.badResponse
         for attempt in 0..<2 {
             do {
                 if attempt > 0 {
-                    // 让用户看出来是在重试，而不是卡死
-                    routeSummary[item.id] = "正在解析下载地址（重试 \(attempt)/1）…"
-                    try await Task.sleep(nanoseconds: UInt64(Self.resolveRetryDelay * 1_000_000_000))
+                    routeSummary[item.id] = "网络抖动，正在重试…"
+                    try await Task.sleep(nanoseconds: 800_000_000)
                 }
-                let signed = try await Self.resolveWithTimeout(client: client, source: item.source)
-                // 解析成功：清掉可能存在的“重试…”文案，后面下载会刷自己的说明
-                routeSummary[item.id] = nil
-                return try await run(item: item,
-                                     engine: engine,
-                                     signedURL: signed,
-                                     settings: settings,
-                                     onProgress: onProgress)
+                let result = try await engine.download(request, progress: onProgress)
+                routeSummary[item.id] = "\(Self.describe(request.routes)) · 平均 \(formatSpeed(result.averageSpeed))"
+                return result.fileURL
             } catch {
-                if !Self.shouldRetry(error) { throw error }
+                if Self.isCancellation(error) { throw error }
                 lastError = error
-                if attempt == 0 { states[item.id] = .resolving }
+                if !Self.shouldRetry(error) { throw error }
             }
         }
         throw lastError
     }
 
-    /// 30s 内拿不到签名地址就抛 requestTimeout（中文文案见 GitHubError）。
-    /// 取消优先透出 CancellationError，不会被包装成超时再白跑一次重试。
-    private static func resolveWithTimeout(client: GitHubClient, source: DownloadSource) async throws -> URL {
-        try await withThrowingTaskGroup(of: URL.self) { group in
-            group.addTask { try await client.resolveDownloadURL(for: source) }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(resolveTimeout * 1_000_000_000))
-                throw GitHubError.requestTimeout
-            }
-            guard let first = try await group.next() else { throw CancellationError() }
-            group.cancelAll()
-            return first
+    /// 组装引擎输入。**全程零网络请求**：地址是拼出来的，不是问出来的。
+    private func makeRequest(item: DownloadItem,
+                             client: GitHubClient,
+                             settings: AccelerationSettings) throws -> DownloadEngine.Request {
+        let start = try client.startURL(for: item.source)
+        let stableURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
+        let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: stableURL)
+
+        // 探测结果只做「锦上添花」：有缓存就直接用（0 延迟），
+        // 没缓存也绝不为了排序把开始时间往后推 —— 引擎会边下边学。
+        var plan = candidates.map { ScoredRoute(route: $0, speed: 1) }
+        if candidates.count > 1, let host = start.url.host, let cached = probeCache.cached(for: host) {
+            let names = Set(candidates.map { $0.name })
+            plan = Self.plan(from: cached.filter { names.contains($0.route.name) }, candidates: candidates)
+        } else if candidates.count > 1, item.source.supportsChunkedDownload {
+            warmProbeCandidates(startURL: start.url, routes: candidates, stableURL: stableURL)
         }
+
+        return DownloadEngine.Request(startURL: start.url,
+                                      stableURL: stableURL,
+                                      routes: plan,
+                                      authToken: client.token,
+                                      startHeaders: start.headers,
+                                      fileName: item.fileName,
+                                      connections: settings.clampedConnections,
+                                      allowChunking: item.source.supportsChunkedDownload,
+                                      resumeKey: item.id)
     }
 
-    private func run(item: DownloadItem,
-                     engine: DownloadEngine,
-                     signedURL: URL,
-                     settings: AccelerationSettings,
-                     onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
-        // ghfast 这类镜像只认 github.com 原始地址，套签名地址会被拒，
-        // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedURL。
-        let githubURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
-
-        let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: githubURL)
-        // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址
-        let basePlan = candidates.map { ScoredRoute(route: $0, speed: 1) }
-        var routeURLs = Self.resolveRouteURLs(basePlan, signedURL: signedURL, githubURL: githubURL)
-
-        // 通道探测（已探过的 5 分钟内直接复用）：
-        // 老实现是「按设置里的固定顺序串行先用第一条」，4 个镜像里前 3 个是死的
-        // 就得干等三次超时 —— 用户体感就是「下不动 / 半天才开始」。
-        // 现在同时探测所有候选，可用的先上岗，死的立刻剔除，并把实测速度
-        // 作为初始权重喂给引擎（不再是从均等的 1 开始瞎试）。
-        var plan: [ScoredRoute]
-        // 探测只在「多通道」时才有意义：单通道（私有仓库直连 / 官方源）直接跳过。
-        // 自定义模式同样受益 —— 先探一下自己的中转通不通，不通就直接走直连，
-        // 不用先让引擎在坏前缀上失败一轮再回退。
-        if candidates.count > 1 {
-            if let host = signedURL.host, let cached = probeCache.cached(for: host) {
-                // 缓存里可能混有「这次不适用」的通道（比如 ghfast 只对发行版有效），
-                // 按本次候选过滤一遍再用，避免把无关通道塞回计划。
-                let names = Set(candidates.map { $0.name })
-                let filtered = cached.filter { names.contains($0.route.name) }
-                plan = Self.plan(from: filtered, candidates: candidates)
-            } else {
-                routeSummary[item.id] = "正在探测最快通道…"
-                let probes = await probeCache.probe(routes: candidates, routeURLs: routeURLs)
-                if let host = signedURL.host { probeCache.store(probes, for: host) }
-                plan = Self.plan(from: probes, candidates: candidates)
+    /// 后台预热通道探测：不阻塞本次下载，只为下一次（或下一个附件）省掉试错。
+    private func warmProbeCandidates(startURL: URL,
+                                     routes: [DownloadRoute],
+                                     stableURL: URL?) {
+        guard let host = startURL.host else { return }
+        let urls = routes.map { route -> URL in
+            switch route.scope {
+            case .any: return route.apply(to: startURL)
+            case .githubOnly: return route.apply(to: stableURL ?? startURL)
             }
-            // 探测后按新的顺序重排 URL，保证 plan 与 routeURLs 一一对应
-            routeURLs = plan.map { scored in
-                switch scored.route.scope {
-                case .any: return scored.route.apply(to: signedURL)
-                case .githubOnly:
-                    guard let githubURL else { return scored.route.apply(to: signedURL) }
-                    return scored.route.apply(to: githubURL)
-                }
-            }
-            routeSummary[item.id] = nil
-        } else {
-            plan = basePlan
         }
-
-        let note = (item.isPrivate && settings.mode == .smart)
-            ? "直连（私有仓库不走镜像）"
-            : Self.describe(plan)
-
-        let connections = settings.clampedConnections
-
-        do {
-            let result = try await engine.download(routeURLs: routeURLs,
-                                                   routes: plan,
-                                                   fileName: item.fileName,
-                                                   connections: connections,
-                                                   allowChunking: item.source.supportsChunkedDownload,
-                                                   progress: onProgress)
-            routeSummary[item.id] = "\(note) · 平均 \(formatSpeed(result.averageSpeed))"
-            return result.fileURL
-        } catch {
-            // 通道可能失效/被限流，整体回退直连再试一次
-            guard Self.shouldRetry(error), plan.contains(where: { !$0.route.isDirect }) else { throw error }
-            // 顺带把探测缓存清掉：这次全军覆没说明排序已经不适用了
-            probeCache.invalidateAll()
-            let result = try await engine.download(routeURLs: [signedURL],
-                                                   routes: [ScoredRoute(route: .direct, speed: 1)],
-                                                   fileName: item.fileName,
-                                                   connections: connections,
-                                                   allowChunking: item.source.supportsChunkedDownload,
-                                                   progress: onProgress)
-            routeSummary[item.id] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
-            return result.fileURL
+        Task.detached(priority: .utility) { [cache = probeCache] in
+            let probes = await cache.probe(routes: routes, routeURLs: urls)
+            guard probes.contains(where: { $0.ok }) else { return }
+            cache.store(probes, for: host)
         }
     }
 
@@ -325,27 +301,6 @@ final class DownloadManager: ObservableObject {
         }
         let source = usable.isEmpty ? probes : usable
         return source.map { ScoredRoute(route: $0.route, speed: max($0.speed, 1)) }
-    }
-
-    /// 给每条通道算出实际请求的 URL。
-    ///
-    /// - `.githubOnly`（ghfast）：套 `https://github.com/...` 稳定地址；
-    ///   若这次下载没有稳定地址，就把这条通道剔掉（避免送上去必然 400）。
-    /// - 其余通道：套已签名的真实地址（原来的行为）。
-    private static func resolveRouteURLs(_ plan: [ScoredRoute],
-                                         signedURL: URL,
-                                         githubURL: URL?) -> [URL] {
-        let urls = plan.compactMap { scored -> URL? in
-            switch scored.route.scope {
-            case .any:
-                return scored.route.apply(to: signedURL)
-            case .githubOnly:
-                guard let githubURL else { return nil }
-                return scored.route.apply(to: githubURL)
-            }
-        }
-        // 全被剔掉（理论上不会，因为直连永远是 .any）时至少保底直连
-        return urls.isEmpty ? [signedURL] : urls
     }
 
     /// 通道描述，例如「多通道 gh-proxy.com + slink.ltd」

@@ -8,6 +8,20 @@ func formatSpeed(_ bytesPerSecond: Double) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(max(bytesPerSecond, 0)), countStyle: .file) + "/s"
 }
 
+/// 剩余时间：42 秒 / 3 分 12 秒 / 1 小时 04 分
+/// 速度未知或已经下完（<1s）时返回 nil，界面据此隐藏这一项，而不是显示「0 秒」。
+func formatDuration(_ seconds: Double) -> String? {
+    guard seconds.isFinite, seconds >= 1 else { return nil }
+    let total = Int(seconds.rounded())
+    if total < 60 { return "\(total) 秒" }
+    if total < 3600 {
+        let minutes = total / 60
+        let rest = total % 60
+        return rest == 0 ? "\(minutes) 分" : "\(minutes) 分 \(rest) 秒"
+    }
+    return String(format: "%d 小时 %02d 分", total / 3600, (total % 3600) / 60)
+}
+
 /// 1200 → 1.2k，34000 → 34k（GitHub 的数字缩写风格）
 func formatCount(_ count: Int) -> String {
     switch count {
