@@ -45,6 +45,37 @@ final class WriteLedger: @unchecked Sendable {
         self.total = total
     }
 
+    /// 用上次落盘的覆盖区间初始化账本（断点续传）。
+    ///
+    /// 与 `record` 的区别：这里是「已知这些字节在文件里」，直接合并即可，
+    /// 不参与重叠统计 —— 否则续传一启动就会被判成「重复写入」。
+    func seed(_ incoming: [ClosedRange<Int64>]) {
+        guard !incoming.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        for range in incoming.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            guard range.lowerBound >= 0, range.upperBound < total,
+                  range.lowerBound <= range.upperBound else { continue }
+            var mergedStart = range.lowerBound
+            var mergedEnd = range.upperBound
+            var index = lowerBound(mergedStart)
+            if index > 0, ranges[index - 1].upperBound >= mergedStart - 1 { index -= 1 }
+            let start = index
+            while index < ranges.count, ranges[index].lowerBound <= mergedEnd + 1 {
+                mergedStart = min(mergedStart, ranges[index].lowerBound)
+                mergedEnd = max(mergedEnd, ranges[index].upperBound)
+                index += 1
+            }
+            ranges.replaceSubrange(start..<index, with: [mergedStart...mergedEnd])
+        }
+        covered = ranges.reduce(Int64(0)) { $0 + ($1.upperBound - $1.lowerBound + 1) }
+    }
+
+    /// 导出当前已覆盖区间（checkpoint 落盘用）
+    func rangesSnapshot() -> [[Int64]] {
+        lock.lock(); defer { lock.unlock() }
+        return ranges.map { [$0.lowerBound, $0.upperBound] }
+    }
+
     /// 登记一次写盘。
     ///
     /// - Returns: 真正新覆盖的字节数。若该区间已被完全写过，返回 0；

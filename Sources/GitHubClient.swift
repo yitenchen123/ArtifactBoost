@@ -33,6 +33,12 @@ private struct GHErrorMessage: Codable {
     let message: String?
 }
 
+/// 一次下载的「起步地址」：URL + 该地址需要的额外请求头。
+struct DownloadStart: Sendable {
+    let url: URL
+    var headers: [String: String] = [:]
+}
+
 /// 搜索排序方式
 enum RepoSort: String, CaseIterable, Identifiable {
     case bestMatch
@@ -57,6 +63,19 @@ final class GitHubClient: Sendable {
     init(token: String) {
         self.token = token
     }
+
+    /// 复用的「重定向拦截」会话。
+    ///
+    /// 老实现每次解析都新建一个 URLSession，拿到 302 就 `invalidateAndCancel` ——
+    /// 等于每次都要重做 DNS + TCP + TLS 三次握手，弱网下就是白等 1~2 秒。
+    /// 换成复用会话后，后续请求直接跑在已建立的连接上，只花一个 RTT。
+    private static let redirectSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpMaximumConnectionsPerHost = 4
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config, delegate: RedirectCatcher(), delegateQueue: nil)
+    }()
 
     func makeURL(_ path: String, query: [URLQueryItem] = []) throws -> URL {
         var comps = URLComponents(string: "https://api.github.com")
@@ -169,14 +188,13 @@ final class GitHubClient: Sendable {
         ])
     }
 
-    /// 解析任意下载项的签名地址。
+/// 解析任意下载项的签名地址。
     /// GitHub 对这些接口都会 302 跳转到带签名的真实地址（产物/日志在 Azure Blob，
     /// 源码包在 codeload），这里拦下跳转拿到真实地址，后续分段下载直接打这个地址
     /// （不再需要 Token，也不再经过 api.github.com）。
     ///
-    /// 加速要点：不再真的把请求发完 —— 用 `.stopLoading` 在**收到 302 响应头**的
-    /// 瞬间就掐断连接。产物是几百 MB 的资源，走完 HEAD/GET 的整个响应体纯属浪费；
-    /// 302 一出现 Location 就有了。
+    /// 注意：正常下载路径**已经不再调用它**（见 `startURL`，第一个 Range 请求
+    /// 自己就会跟随 302 并拿到真实地址）。保留它是给「诊断 / 兜底」用的。
     func resolveDownloadURL(for source: DownloadSource) async throws -> URL {
         var extraHeaders: [String: String] = [:]
         // 解析阶段用 HEAD：只要 302 头，不要正文。
@@ -252,12 +270,47 @@ final class GitHubClient: Sendable {
         throw lastError
     }
 
+    /// 直接可用的「起步地址」：不再先空跑一次 API 解析，
+    /// 而是把第一个带 Range 的真实下载请求直接打到这个地址上。
+    ///
+    /// - 发行版附件：用 `github.com/.../releases/download/...` 的**稳定公开地址**，
+    ///   连 api.github.com 都不用碰（国内这条链路往往是最慢的）；
+    /// - 源码包：用 `codeload.github.com`，GitHub 现场打包同样支持直连；
+    /// - 构建产物 / 构建日志：必须走 api.github.com（要 Token 才给签名地址）。
+    ///
+    /// - Returns: 地址 + 该地址需要的额外请求头（例如附件接口要 `Accept` 才回二进制）。
+    func startURL(for source: DownloadSource) throws -> DownloadStart {
+        switch source {
+        case .releaseAsset(let repo, let assetID, let browserURL):
+            if let raw = browserURL, let url = URL(string: raw) {
+                return DownloadStart(url: url)
+            }
+            return DownloadStart(url: try makeURL("repos/\(repo)/releases/assets/\(assetID)"),
+                                 headers: ["Accept": "application/octet-stream"])
+        case .sourceArchive(let repo, let ref, let format):
+            let trimmed = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                // 空 ref（默认分支）交给 API 自己解析，避免猜错分支
+                return DownloadStart(url: try makeURL("repos/\(repo)/\(format.path)"))
+            }
+            let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+            var comps = URLComponents()
+            comps.scheme = "https"
+            comps.host = "codeload.github.com"
+            comps.path = "/\(repo)/\(format.codeloadPath)/\(encoded)"
+            guard let url = comps.url else { throw GitHubError.badURL }
+            return DownloadStart(url: url)
+        case .artifact(let repo, let id):
+            return DownloadStart(url: try makeURL("repos/\(repo)/actions/artifacts/\(id)/zip"))
+        case .runLogs(let repo, let runID):
+            return DownloadStart(url: try makeURL("repos/\(repo)/actions/runs/\(runID)/logs"))
+        }
+    }
+
     /// 只取响应头、丢弃正文：拦下 302 后立刻 `stopLoading`，
     /// 不让 URLSession 继续把几百 MB 的产物正文拉下来。
     private static func fetchRedirectOnly(_ request: URLRequest) async throws -> (Data, URLResponse) {
-        let delegate = RedirectCatcher()
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
+        let session = redirectSession
         return try await session.data(for: request)
     }
 }

@@ -5,6 +5,8 @@ enum ArchiveFormat: String, Hashable, Sendable, Codable {
     case tarball
 
     var path: String { self == .zip ? "zipball" : "tarball" }
+    /// codeload.github.com 用的路径段（源码包直连，不再经过 api.github.com）
+    var codeloadPath: String { self == .zip ? "zip" : "tar.gz" }
     var fileExtension: String { self == .zip ? "zip" : "tar.gz" }
     var title: String { self == .zip ? "ZIP" : "TAR.GZ" }
 }

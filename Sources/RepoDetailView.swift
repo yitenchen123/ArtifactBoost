@@ -146,6 +146,16 @@ struct RepoDetailView: View {
 
     @ViewBuilder
     private var overviewTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            readmeCard
+            if let latest = latestRelease {
+                latestReleaseCard(latest)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var readmeCard: some View {
         if readmeLoading && readme == nil {
             card {
                 SkeletonBlock(lines: 6)
@@ -196,6 +206,57 @@ struct RepoDetailView: View {
         }
     }
 
+    // MARK: - 最新发行版（概览页入口）
+
+    /// GitHub 只把「最新的非草稿、非预发布」标为最新发行版
+    private var latestRelease: GHRelease? {
+        releases.first { !$0.draft && !$0.prerelease } ?? releases.first
+    }
+
+    private func isLatestRelease(_ release: GHRelease) -> Bool {
+        guard let latest = latestRelease else { return false }
+        return latest.id == release.id && !release.draft && !release.prerelease
+    }
+
+    @ViewBuilder
+    private func latestReleaseCard(_ release: GHRelease) -> some View {
+        card(padding: 0) {
+            VStack(spacing: 0) {
+                HStack(spacing: 7) {
+                    Image(systemName: "shippingbox.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.purple)
+                    Text("发行版")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.strongText)
+                    Spacer(minLength: 8)
+                    Button {
+                        tab = .releases
+                    } label: {
+                        HStack(spacing: 2) {
+                            Text("全部 \(releases.count) 个")
+                            Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold))
+                        }
+                        .font(.caption.weight(.semibold))
+                    }
+                    .tint(Theme.blue)
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
+
+                Hairline()
+
+                NavigationLink(value: release) {
+                    ReleaseRow(release: release, isLatest: isLatestRelease(release))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
     // MARK: - 构建
 
     @ViewBuilder
@@ -238,16 +299,23 @@ struct RepoDetailView: View {
                            message: "该仓库没有发布过 Release")
             }
         } else {
-            card(padding: 0) {
-                VStack(spacing: 0) {
-                    ForEach(Array(releases.enumerated()), id: \.element.id) { index, release in
-                        if index > 0 { Hairline().padding(.leading, 58) }
-                        NavigationLink(value: release) {
-                            ReleaseRow(release: release)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 11)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("全部发行版")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.muted)
+                    .padding(.horizontal, Theme.screenPadding)
+
+                card(padding: 0) {
+                    VStack(spacing: 0) {
+                        ForEach(Array(releases.enumerated()), id: \.element.id) { index, release in
+                            if index > 0 { Hairline() }
+                            NavigationLink(value: release) {
+                                ReleaseRow(release: release, isLatest: isLatestRelease(release))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 12)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -376,6 +444,13 @@ struct RepoDetailView: View {
         do {
             switch tab {
             case .overview:
+                // 概览页除了 README，还要展示「最新发行版」入口，所以顺带拉一次 releases。
+                // 失败时静默跳过，不能因为发行版接口报错就让 README 显示不出来。
+                if !releasesLoaded || force,
+                   let loaded = try? await client.releases(repo: repo) {
+                    releases = loaded
+                    releasesLoaded = true
+                }
                 guard readme == nil || force else { return }
                 readmeLoading = true
                 defer { readmeLoading = false }
@@ -493,47 +568,65 @@ private struct RunRow: View {
 
 private struct ReleaseRow: View {
     let release: GHRelease
+    /// 是否为「最新发行版」（GitHub 用绿色标注最新稳定版）
+    var isLatest: Bool = false
 
     private var totalSize: Int64 {
         release.assets.reduce(0) { $0 + $1.size }
     }
 
+    /// GitHub 移动端风格：一个月内显示相对时间（去掉「前」），更早显示日期
+    private var dateText: String? {
+        guard let date = release.publishedAt else { return nil }
+        if Date().timeIntervalSince(date) < 30 * 86400 {
+            return formatRelative(date).replacingOccurrences(of: "前", with: "")
+        }
+        return date.formatted(date: .long, time: .omitted)
+    }
+
     var body: some View {
         HStack(spacing: 12) {
-            IconBadge(systemName: "tag.fill", color: Theme.purple)
-
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(release.displayName)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Theme.strongText)
                     .lineLimit(2)
-                HStack(spacing: 6) {
-                    Text(release.tagName)
+
+                HStack(spacing: 5) {
+                    if let dateText {
+                        Text(dateText)
+                            .foregroundStyle(Theme.muted)
+                        Text("·")
+                            .foregroundStyle(Theme.subtle)
+                    }
+                    if isLatest {
+                        Text("最新发行版")
+                            .foregroundStyle(Theme.green)
+                            .fontWeight(.semibold)
+                    } else if release.prerelease {
+                        Text("预发行")
+                            .foregroundStyle(Theme.orange)
+                            .fontWeight(.semibold)
+                    } else if release.draft {
+                        Text("草稿")
+                            .foregroundStyle(Theme.muted)
+                            .fontWeight(.semibold)
+                    } else {
+                        Text("正式版")
+                            .foregroundStyle(Theme.muted)
+                    }
                     if !release.assets.isEmpty {
                         Text("·")
-                        Text("\(release.assets.count) 个附件")
-                        Text("·")
+                            .foregroundStyle(Theme.subtle)
                         Text(formatBytes(totalSize))
+                            .foregroundStyle(Theme.subtle)
                     }
                 }
-                .font(.caption2)
-                .foregroundStyle(Theme.subtle)
-                if let date = release.publishedAt {
-                    Text(formatRelative(date))
-                        .font(.caption2)
-                        .foregroundStyle(Theme.subtle)
-                }
+                .font(.system(size: 13))
+                .lineLimit(1)
             }
 
             Spacer(minLength: 0)
-
-            if release.prerelease {
-                StatusPill(text: "预发布", color: Theme.orange)
-            } else if release.draft {
-                StatusPill(text: "草稿", color: .gray)
-            } else {
-                StatusPill(text: "发行版", color: Theme.green)
-            }
 
             Image(systemName: "chevron.right")
                 .font(.caption2.weight(.semibold))
