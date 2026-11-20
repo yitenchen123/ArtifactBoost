@@ -784,7 +784,10 @@ final class DownloadEngine: @unchecked Sendable {
         if let status = boot?.status, !(200...299).contains(status) {
             // 把常见的 GitHub 错误码翻译成人话，而不是笼统的「服务器响应异常」
             switch status {
-            case 401, 403, 404, 410:
+            case 410:
+                // 410 = 产物已被 GitHub 清理，给用户一句明确的话
+                throw GitHubError.artifactExpired
+            case 401, 403, 404:
                 throw GitHubError.http(status, "")
             default:
                 throw DownloadError.badResponse
