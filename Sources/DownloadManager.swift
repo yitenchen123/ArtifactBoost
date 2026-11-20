@@ -248,7 +248,7 @@ final class DownloadManager: ObservableObject {
     private func makeRequest(item: DownloadItem,
                              client: GitHubClient,
                              settings: AccelerationSettings) throws -> DownloadEngine.Request {
-        let start = try client.startURL(for: item.source)
+        let start = try client.startURL(for: item.source, isPrivate: item.isPrivate)
         let stableURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
         let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: stableURL)
 

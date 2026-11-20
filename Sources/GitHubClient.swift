@@ -279,10 +279,12 @@ final class GitHubClient: Sendable {
     /// - 构建产物 / 构建日志：必须走 api.github.com（要 Token 才给签名地址）。
     ///
     /// - Returns: 地址 + 该地址需要的额外请求头（例如附件接口要 `Accept` 才回二进制）。
-    func startURL(for source: DownloadSource) throws -> DownloadStart {
+    func startURL(for source: DownloadSource, isPrivate: Bool = false) throws -> DownloadStart {
         switch source {
         case .releaseAsset(let repo, let assetID, let browserURL):
-            if let raw = browserURL, let url = URL(string: raw) {
+            // 公开仓库直接用 github.com 稳定地址（不碰 api.github.com）；
+            // 私有仓库走 API 端点，Token 鉴权是官方文档保证的路径，最稳。
+            if !isPrivate, let raw = browserURL, let url = URL(string: raw) {
                 return DownloadStart(url: url)
             }
             return DownloadStart(url: try makeURL("repos/\(repo)/releases/assets/\(assetID)"),
