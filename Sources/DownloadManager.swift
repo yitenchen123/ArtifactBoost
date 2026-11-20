@@ -7,6 +7,8 @@ final class DownloadManager: ObservableObject {
         case idle
         case resolving
         case downloading(DownloadProgress)
+        /// 用户主动暂停：半成品与续传账本都保留，点「继续」从断点接着下
+        case paused(DownloadProgress)
         case finished(URL)
         case failed(String)
     }
@@ -16,6 +18,8 @@ final class DownloadManager: ObservableObject {
     @Published var routeSummary: [String: String] = [:]
     @Published private(set) var order: [String] = []
     @Published private(set) var items: [String: DownloadItem] = [:]
+    /// 最近一帧进度：暂停时用它渲染「已下 X%，点继续接着下」
+    @Published private(set) var lastProgress: [String: DownloadProgress] = [:]
 
     private var engines: [String: DownloadEngine] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
@@ -46,7 +50,6 @@ final class DownloadManager: ObservableObject {
             return false
         }.count
     }
-
     var orderedItems: [DownloadItem] {
         order.compactMap { items[$0] }
     }
@@ -79,8 +82,9 @@ final class DownloadManager: ObservableObject {
         let onProgress: @Sendable (DownloadProgress) -> Void = { [weak self] progress in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.lastProgress[itemID] = progress
                 switch self.states[itemID] {
-                case .resolving?, .downloading?, .none:
+                case .resolving?, .downloading?, .paused?, .none:
                     self.states[itemID] = .downloading(progress)
                 default:
                     break
@@ -96,11 +100,18 @@ final class DownloadManager: ObservableObject {
                                                     settings: settings,
                                                     onProgress: onProgress)
                 states[item.id] = .finished(url)
+                lastProgress[item.id] = nil
                 // 下完了：清掉落盘记录，避免重启后复活
                 taskStore.remove(id: item.id)
             } catch {
                 if Self.isCancellation(error) {
-                    states[item.id] = .idle
+                    // 取消有两种：用户点了暂停（状态已由 pause 设好，别覆盖），
+                    // 以及用户点了取消（pause 之外的分支）。这里只在还是「下载中」时回 idle。
+                    if case .paused? = states[item.id] {
+                        // 暂停状态保持不动
+                    } else {
+                        states[item.id] = .idle
+                    }
                 } else {
                     states[item.id] = .failed(error.localizedDescription)
                     // 失败不自动续下：清记录，用户手动重试时会重新落盘
@@ -111,6 +122,23 @@ final class DownloadManager: ObservableObject {
             tasks[item.id] = nil
             endBackgroundTask(for: item.id)
         }
+    }
+
+    /// 暂停：掐断连接但**保留**半成品与续传账本，点「继续」从断点接着下。
+    ///
+    /// 与 `cancel` 的区别就在这里 —— 取消是「我不要了」（连同半成品一起删），
+    /// 暂停是「等会儿再下」（几百 MB 不能白下）。
+    func pause(_ item: DownloadItem) {
+        guard engines[item.id] != nil else { return }
+        let snapshot = lastProgress[item.id] ?? DownloadProgress()
+        states[item.id] = .paused(snapshot)
+        engines[item.id]?.cancel()
+        tasks[item.id]?.cancel()
+        tasks[item.id] = nil
+        engines[item.id] = nil
+        endBackgroundTask(for: item.id)
+        // 任务记录保留：进程重启后仍能自动续上
+        routeSummary[item.id] = nil
     }
 
     /// 取消下载。
@@ -125,8 +153,10 @@ final class DownloadManager: ObservableObject {
         tasks[item.id] = nil
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
-        // 用户主动取消：清记录，不恢复
+        // 用户主动取消：连同半成品一起清掉，不恢复
         taskStore.remove(id: item.id)
+        ResumeStore.shared.discard(key: item.id)
+        lastProgress[item.id] = nil
         states[item.id] = .idle
     }
 
@@ -137,6 +167,8 @@ final class DownloadManager: ObservableObject {
         engines[item.id] = nil
         endBackgroundTask(for: item.id)
         taskStore.remove(id: item.id)
+        ResumeStore.shared.discard(key: item.id)
+        lastProgress[item.id] = nil
         states[item.id] = nil
         routeSummary[item.id] = nil
         items[item.id] = nil
@@ -288,6 +320,7 @@ final class DownloadManager: ObservableObject {
                                                    fileName: item.fileName,
                                                    connections: connections,
                                                    allowChunking: item.source.supportsChunkedDownload,
+                                                   resumeKey: item.id,
                                                    progress: onProgress)
             routeSummary[item.id] = "\(note) · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
@@ -301,6 +334,7 @@ final class DownloadManager: ObservableObject {
                                                    fileName: item.fileName,
                                                    connections: connections,
                                                    allowChunking: item.source.supportsChunkedDownload,
+                                                   resumeKey: item.id,
                                                    progress: onProgress)
             routeSummary[item.id] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL

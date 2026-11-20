@@ -134,6 +134,9 @@ struct DownloadItemRow: View {
         case .downloading(let progress):
             downloadingView(progress)
 
+        case .paused(let progress):
+            pausedView(progress)
+
         case .finished(let url):
             finishedView(url)
 
@@ -199,6 +202,16 @@ struct DownloadItemRow: View {
                             Text("· 限流 \(diagnostics.throttles)")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(Theme.orange)
+                        }
+                        if progress.etaSeconds > 0 {
+                            Text("· 剩余 \(formatDuration(progress.etaSeconds))")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.subtle)
+                        }
+                        if progress.resumedBytes > 0 {
+                            Text("· 已续传 \(formatBytes(progress.resumedBytes))")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Theme.green)
                         }
                         Spacer(minLength: 0)
                     }
