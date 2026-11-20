@@ -203,8 +203,8 @@ struct DownloadItemRow: View {
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(Theme.orange)
                         }
-                        if progress.etaSeconds > 0 {
-                            Text("· 剩余 \(formatDuration(progress.etaSeconds))")
+                        if let eta = formatDuration(progress.etaSeconds) {
+                            Text("· 剩余 \(eta)")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.subtle)
                         }
@@ -250,6 +250,15 @@ struct DownloadItemRow: View {
                 Spacer()
 
                 Button {
+                    downloads.pause(item)
+                } label: {
+                    Label("暂停", systemImage: "pause.circle.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Theme.orange)
+                }
+                .buttonStyle(.plain)
+
+                Button {
                     downloads.cancel(item)
                 } label: {
                     Label("取消", systemImage: "xmark.circle.fill")
@@ -259,6 +268,68 @@ struct DownloadItemRow: View {
                 .buttonStyle(.plain)
             }
             .padding(.top, 1)
+        }
+    }
+
+    // MARK: - 已暂停
+
+    private func pausedView(_ progress: DownloadProgress) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if progress.totalBytes > 0 {
+                GradientProgressBar(fraction: progress.fraction, height: 9, stalled: false)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("\(Int(progress.fraction * 100))%")
+                        .font(.system(size: 17, weight: .heavy, design: .rounded))
+                        .foregroundStyle(Theme.strongText)
+                        .monospacedDigit()
+                    Text("\(formatBytes(progress.downloadedBytes)) / \(formatBytes(progress.totalBytes))")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .monospacedDigit()
+                    Spacer(minLength: 0)
+                    Text("已暂停")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Theme.orange)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Theme.orange.opacity(0.12), in: Capsule())
+                }
+            } else {
+                Text("已暂停")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.orange)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    downloads.start(item, settings: AccelerationSettings.load())
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "play.fill")
+                        Text("继续下载")
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Theme.brandGradient,
+                                in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+                }
+                .buttonStyle(PressableStyle())
+
+                Button {
+                    downloads.cancel(item)
+                } label: {
+                    Text("取消")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Theme.red)
+                        .frame(width: 62)
+                        .padding(.vertical, 8)
+                        .background(Theme.red.opacity(0.1),
+                                    in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+                }
+                .buttonStyle(PressableStyle())
+            }
         }
     }
 
