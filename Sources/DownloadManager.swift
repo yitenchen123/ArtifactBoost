@@ -24,6 +24,8 @@ final class DownloadManager: ObservableObject {
     private var engines: [String: DownloadEngine] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var backgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
+    /// 每次 start 递增：暂停后立刻「继续」时，旧任务的收尾不能误删新一代的引擎/任务引用
+    private var generations: [String: Int] = [:]
 
     /// 未完成任务的落盘：进程被杀后靠它自动续下
     private let taskStore = DownloadTaskStore()
@@ -76,6 +78,8 @@ final class DownloadManager: ObservableObject {
 
         let engine = DownloadEngine()
         engines[item.id] = engine
+        let generation = (generations[item.id] ?? 0) + 1
+        generations[item.id] = generation
         beginBackgroundTask(for: item.id)
 
         let itemID = item.id
@@ -118,9 +122,13 @@ final class DownloadManager: ObservableObject {
                     taskStore.remove(id: item.id)
                 }
             }
-            engines[item.id] = nil
-            tasks[item.id] = nil
-            endBackgroundTask(for: item.id)
+            // 只有「还是这一代任务」才清理；否则会把用户刚点「继续」新建的那一代误删
+            if generations[item.id] == generation {
+                generations[item.id] = nil
+                engines[item.id] = nil
+                tasks[item.id] = nil
+                endBackgroundTask(for: item.id)
+            }
         }
     }
 
