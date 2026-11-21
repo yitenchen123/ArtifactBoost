@@ -114,9 +114,13 @@ final class DownloadManager: ObservableObject {
         let onProgress: @Sendable (DownloadProgress) -> Void = { [weak self] progress in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.lastProgress[itemID] = progress
+                // 只接受「本代任务」且仍在活动状态时的进度。
+                // 否则取消 / 暂停后仍在途的最后一拍进度会把状态又推回「下载中」，
+                // 用户看到的就是「点了暂停还在跑」。
+                guard self.generations[itemID] == generation else { return }
                 switch self.states[itemID] {
-                case .resolving?, .downloading?, .paused?, .none:
+                case .resolving?, .downloading?:
+                    self.lastProgress[itemID] = progress
                     self.states[itemID] = .downloading(progress)
                 default:
                     break
@@ -146,6 +150,7 @@ final class DownloadManager: ObservableObject {
                     }
                 } else {
                     states[item.id] = .failed(error.localizedDescription)
+                    routeSummary[item.id] = nil
                     // 失败不自动续下：清记录，用户手动重试时会重新落盘
                     taskStore.remove(id: item.id)
                 }
@@ -293,6 +298,8 @@ final class DownloadManager: ObservableObject {
                     try? FileManager.default.removeItem(at: result.fileURL)
                     throw DownloadError.verificationFailed(reason)
                 }
+                // 校验期间用户可能已经点了取消：别再把它标成「完成」
+                try Task.checkCancellation()
                 routeSummary[item.id] = "\(Self.describe(request.routes)) · 平均 \(formatSpeed(result.averageSpeed))"
                 return result.fileURL
             } catch {
