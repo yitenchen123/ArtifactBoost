@@ -35,6 +35,10 @@ struct DownloadItemRow: View {
             speedSamples.append(newValue)
             if speedSamples.count > 32 { speedSamples.removeFirst(speedSamples.count - 32) }
         }
+        .onChange(of: downloads.state(for: item)) { newState in
+            // 重新开始下载时清掉上一轮的速度曲线，别把两次下载的数据连成一条
+            if case .resolving = newState { speedSamples.removeAll() }
+        }
     }
 
     /// 当前这一帧的分段明细（未在下载时为 nil）
