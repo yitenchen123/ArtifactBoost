@@ -9,6 +9,8 @@ final class DownloadManager: ObservableObject {
         case downloading(DownloadProgress)
         /// 用户主动暂停：半成品与续传账本都保留，点「继续」从断点接着下
         case paused(DownloadProgress)
+        /// 达到「同时下载数」上限，排队等前面的完成
+        case queued
         case finished(URL)
         case failed(String)
     }
@@ -27,6 +29,9 @@ final class DownloadManager: ObservableObject {
     /// 每次 start 递增：暂停后立刻「继续」时，旧任务的收尾不能误删新一代的引擎/任务引用
     private var generations: [String: Int] = [:]
 
+    /// 下载队列：超过「同时下载数」的任务排在这里，前面的完成 / 取消 / 暂停后自动补位
+    private var pending: [(id: String, settings: AccelerationSettings)] = []
+
     /// 未完成任务的落盘：进程被杀后靠它自动续下
     private let taskStore = DownloadTaskStore()
 
@@ -37,6 +42,8 @@ final class DownloadManager: ObservableObject {
 
     init(session: SessionManager) {
         self.session = session
+        // 清掉 7 天都没动静的续传残留，避免半成品永久占着磁盘
+        ResumeStore.shared.prune()
     }
 
     // MARK: - 查询
@@ -52,6 +59,12 @@ final class DownloadManager: ObservableObject {
             return false
         }.count
     }
+    var queuedCount: Int {
+        states.values.filter {
+            if case .queued = $0 { return true }
+            return false
+        }.count
+    }
     var orderedItems: [DownloadItem] {
         order.compactMap { items[$0] }
     }
@@ -61,10 +74,25 @@ final class DownloadManager: ObservableObject {
     func start(_ item: DownloadItem, settings: AccelerationSettings) {
         guard let client = session.client else { return }
         switch state(for: item) {
-        case .resolving, .downloading:
+        case .resolving, .downloading, .queued:
             return
         default:
             break
+        }
+
+        // 达到「同时下载数」上限：排队，等前面的下完自动开始（IDM 的下载队列）
+        if activeCount >= settings.clampedMaxConcurrent {
+            if items[item.id] == nil {
+                order.insert(item.id, at: 0)
+            }
+            items[item.id] = item
+            states[item.id] = .queued
+            routeSummary[item.id] = "排队中 · 等待前面的下载完成"
+            taskStore.save(TaskRecord(item: item, settings: settings))
+            if !pending.contains(where: { $0.id == item.id }) {
+                pending.append((item.id, settings))
+            }
+            return
         }
 
         if items[item.id] == nil {
@@ -129,7 +157,27 @@ final class DownloadManager: ObservableObject {
                 tasks[item.id] = nil
                 endBackgroundTask(for: item.id)
             }
+            // 让出一个名额：队列里的下一个自动开始
+            drainQueue()
         }
+    }
+
+    /// 从队列里补一个任务进来（一次只补一个：每次调用都对应一个被让出的名额）
+    private func drainQueue() {
+        guard let index = pending.firstIndex(where: { entry in
+            guard let item = items[entry.id] else { return false }
+            if case .queued = state(for: item) { return true }
+            return false
+        }) else { return }
+        let entry = pending.remove(at: index)
+        guard let item = items[entry.id] else { return }
+        // start 会把状态推到 resolving；先复位，免得被自己的 .queued 守卫挡回来
+        states[entry.id] = .idle
+        start(item, settings: entry.settings)
+    }
+
+    private func removeFromQueue(_ id: String) {
+        pending.removeAll { $0.id == id }
     }
 
     /// 暂停：掐断连接但**保留**半成品与续传账本，点「继续」从断点接着下。
@@ -147,6 +195,8 @@ final class DownloadManager: ObservableObject {
         endBackgroundTask(for: item.id)
         // 任务记录保留：进程重启后仍能自动续上
         routeSummary[item.id] = nil
+        removeFromQueue(item.id)
+        drainQueue()
     }
 
     /// 取消下载。
@@ -166,6 +216,8 @@ final class DownloadManager: ObservableObject {
         ResumeStore.shared.discard(key: item.id)
         lastProgress[item.id] = nil
         states[item.id] = .idle
+        removeFromQueue(item.id)
+        drainQueue()
     }
 
     func remove(_ item: DownloadItem) {
@@ -178,6 +230,8 @@ final class DownloadManager: ObservableObject {
         ResumeStore.shared.discard(key: item.id)
         lastProgress[item.id] = nil
         states[item.id] = nil
+        removeFromQueue(item.id)
+        drainQueue()
         routeSummary[item.id] = nil
         items[item.id] = nil
         order.removeAll { $0 == item.id }
@@ -233,6 +287,11 @@ final class DownloadManager: ObservableObject {
                     try await Task.sleep(nanoseconds: 800_000_000)
                 }
                 let result = try await engine.download(request, progress: onProgress)
+                // 长度对不代表内容对：压缩包再验一次结构/CRC，坏包当场重试而不是留给用户解压时才发现
+                if let reason = ArtifactVerifier.verify(result.fileURL) {
+                    try? FileManager.default.removeItem(at: result.fileURL)
+                    throw DownloadError.verificationFailed(reason)
+                }
                 routeSummary[item.id] = "\(Self.describe(request.routes)) · 平均 \(formatSpeed(result.averageSpeed))"
                 return result.fileURL
             } catch {

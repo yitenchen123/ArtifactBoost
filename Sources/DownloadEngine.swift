@@ -99,6 +99,8 @@ enum DownloadError: LocalizedError, Equatable {
     case noRangeSupport
     /// 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避
     case throttled(code: Int, retryAfter: TimeInterval?)
+    /// 文件下载完整（长度对得上）但内容结构不对：压缩包损坏 / 截断
+    case verificationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -109,6 +111,7 @@ enum DownloadError: LocalizedError, Equatable {
             return "下载失败：文件字节校验不通过（\(detail)），请重试"
         case .noRangeSupport: return "下载失败：该通道不支持分段下载"
         case .throttled(let code, _): return "下载失败：服务器限流（\(code)）"
+        case .verificationFailed(let reason): return "文件校验失败：\(reason)，已自动重试"
         }
     }
 
@@ -120,6 +123,8 @@ enum DownloadError: LocalizedError, Equatable {
         case let (.incompleteDetailed(a), .incompleteDetailed(b)):
             return a == b
         case let (.throttled(a, _), .throttled(b, _)):
+            return a == b
+        case let (.verificationFailed(a), .verificationFailed(b)):
             return a == b
         default:
             return false

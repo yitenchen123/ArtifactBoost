@@ -10,6 +10,13 @@ struct DownloadsView: View {
     private var orderedItems: [DownloadItem] { downloads.orderedItems }
 
     /// 所有在下载任务的速度之和
+    private var headerText: String {
+        var parts: [String] = []
+        if downloads.activeCount > 0 { parts.append("正在下载 \(downloads.activeCount) 个") }
+        if downloads.queuedCount > 0 { parts.append("\(downloads.queuedCount) 个排队") }
+        return parts.isEmpty ? "全部下载" : parts.joined(separator: " · ")
+    }
+
     private var totalSpeed: Double {
         orderedItems.reduce(0) { partial, item in
             if case .downloading(let progress) = downloads.state(for: item) {
@@ -59,7 +66,7 @@ struct DownloadsView: View {
                     }
                 } header: {
                     HStack {
-                        Text(downloads.activeCount > 0 ? "正在下载 \(downloads.activeCount) 个" : "全部下载")
+                        Text(headerText)
                         Spacer()
                         if downloads.activeCount > 0 {
                             // 头部也能看到实时总速度
