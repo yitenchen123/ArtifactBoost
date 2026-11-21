@@ -215,6 +215,7 @@ final class DownloadManager: ObservableObject {
         taskStore.remove(id: item.id)
         ResumeStore.shared.discard(key: item.id)
         lastProgress[item.id] = nil
+        routeSummary[item.id] = nil
         states[item.id] = .idle
         removeFromQueue(item.id)
         drainQueue()
