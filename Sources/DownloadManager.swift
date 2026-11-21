@@ -135,24 +135,30 @@ final class DownloadManager: ObservableObject {
                                                     engine: engine,
                                                     settings: settings,
                                                     onProgress: onProgress)
-                states[item.id] = .finished(url)
-                lastProgress[item.id] = nil
+                // 用户可能在下完的瞬间点了「移除」：列表里已经没有这一项，别留下幽灵状态
+                if items[item.id] != nil {
+                    states[item.id] = .finished(url)
+                    lastProgress[item.id] = nil
+                }
                 // 下完了：清掉落盘记录，避免重启后复活
                 taskStore.remove(id: item.id)
             } catch {
-                if Self.isCancellation(error) {
-                    // 取消有两种：用户点了暂停（状态已由 pause 设好，别覆盖），
-                    // 以及用户点了取消（pause 之外的分支）。这里只在还是「下载中」时回 idle。
-                    if case .paused? = states[item.id] {
-                        // 暂停状态保持不动
+                // 任务已被移除时只做收尾，不再写状态（否则会留下幽灵条目）
+                if items[item.id] != nil {
+                    if Self.isCancellation(error) {
+                        // 取消有两种：用户点了暂停（状态已由 pause 设好，别覆盖），
+                        // 以及用户点了取消（pause 之外的分支）。这里只在还是「下载中」时回 idle。
+                        if case .paused? = states[item.id] {
+                            // 暂停状态保持不动
+                        } else {
+                            states[item.id] = .idle
+                        }
                     } else {
-                        states[item.id] = .idle
+                        states[item.id] = .failed(error.localizedDescription)
+                        routeSummary[item.id] = nil
+                        // 失败不自动续下：清记录，用户手动重试时会重新落盘
+                        taskStore.remove(id: item.id)
                     }
-                } else {
-                    states[item.id] = .failed(error.localizedDescription)
-                    routeSummary[item.id] = nil
-                    // 失败不自动续下：清记录，用户手动重试时会重新落盘
-                    taskStore.remove(id: item.id)
                 }
             }
             // 只有「还是这一代任务」才清理；否则会把用户刚点「继续」新建的那一代误删
@@ -348,7 +354,8 @@ final class DownloadManager: ObservableObject {
                                       fileName: item.fileName,
                                       connections: settings.clampedConnections,
                                       allowChunking: item.source.supportsChunkedDownload,
-                                      resumeKey: item.id)
+                                      resumeKey: item.id,
+                                      expectedSize: item.size)
     }
 
     /// 后台预热通道探测：不阻塞本次下载，只为下一次（或下一个附件）省掉试错。
