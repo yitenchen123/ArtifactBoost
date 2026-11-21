@@ -354,7 +354,8 @@ final class DownloadManager: ObservableObject {
                                       fileName: item.fileName,
                                       connections: settings.clampedConnections,
                                       allowChunking: item.source.supportsChunkedDownload,
-                                      resumeKey: item.id)
+                                      resumeKey: item.id,
+                                      expectedSize: item.size)
     }
 
     /// 后台预热通道探测：不阻塞本次下载，只为下一次（或下一个附件）省掉试错。

@@ -748,6 +748,8 @@ final class DownloadEngine: @unchecked Sendable {
         let allowChunking: Bool
         /// 断点续传的键（下载项 id）
         let resumeKey: String?
+        /// 已知的文件体积（列表接口给的）：小文件直接单连接，省掉起步请求的 256KB 重复下载
+        let expectedSize: Int64?
     }
 
     /// 多通道并行下载（IDM 式单请求起步）。
@@ -780,8 +782,11 @@ final class DownloadEngine: @unchecked Sendable {
                                    bytesPerLane: Int(Self.maxSliceTarget))
 
         // ---- 起步：一个请求同时完成「解析 / 探体积 / 拿首块」----
+        // 已知是小文件就不起步了：单连接本来就要整个下一遍，
+        // 再先拉 256KB 起步块等于白下一截（小文件占比不低，比如构建日志）。
         var boot: EngineBootstrap? = nil
-        if request.allowChunking {
+        if request.allowChunking,
+           (request.expectedSize ?? Int64.max) >= Self.minChunkedTotal {
             boot = try await fetchBootstrap(url: request.startURL,
                                             authToken: request.authToken,
                                             headers: request.startHeaders)
@@ -799,7 +804,7 @@ final class DownloadEngine: @unchecked Sendable {
             }
         }
         let finalURL = boot?.finalURL ?? request.startURL
-        let total = boot?.total ?? 0
+        let total = boot?.total ?? (request.expectedSize ?? 0)
 
         // 不支持分段 / 体积太小 / 探测不到体积：单连接（但依然带真实进度）
         if boot?.chunked != true || total < Self.minChunkedTotal {
