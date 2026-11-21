@@ -4,6 +4,7 @@ import UIKit
 /// 设置：账户 + 加速设置（并发）+ 下载源 + 关于
 struct SettingsView: View {
     @EnvironmentObject private var session: SessionManager
+    @EnvironmentObject private var downloads: DownloadManager
 
     @State private var settings = AccelerationSettings.load()
     // 原神彩蛋：长按导航栏「设置」标题触发，二次确认后才跳官网，不做后台静默下载
@@ -13,6 +14,7 @@ struct SettingsView: View {
         List {
             accountSection
             accelerationSection
+            queueSection
             sourceSection
             aboutSection
         }
@@ -118,6 +120,36 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 下载队列
+
+    private var queueSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("同时下载数")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text("\(settings.maxConcurrent) 个")
+                        .font(.system(size: 17, weight: .heavy, design: .rounded))
+                        .foregroundStyle(Theme.blue)
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                }
+                Picker("同时下载数", selection: concurrentBinding) {
+                    ForEach(AccelerationSettings.concurrentOptions, id: \.self) { count in
+                        Text("\(count)").tag(count)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+        } header: {
+            Text("下载队列")
+        } footer: {
+            Text("超出的任务会显示「排队中」，前面的下载完成、取消或暂停后自动补位。多个大文件同时下会互相抢带宽，建议 2~3 个。")
+        }
+    }
+
     // MARK: - 下载源
 
     private var sourceSection: some View {
@@ -200,6 +232,16 @@ struct SettingsView: View {
     private var connectionsBinding: Binding<Int> {
         Binding(get: { settings.connections },
                 set: { settings.connections = $0; settings.save() })
+    }
+
+    private var concurrentBinding: Binding<Int> {
+        Binding(get: { settings.maxConcurrent },
+                set: {
+                    settings.maxConcurrent = $0
+                    settings.save()
+                    // 调大上限后立刻把排队中的任务补进来，不用等现有任务结束
+                    downloads.fillQueueSlots()
+                })
     }
 
     private var prefixBinding: Binding<String> {

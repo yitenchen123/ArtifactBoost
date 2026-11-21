@@ -107,6 +107,8 @@ struct AccelerationSettings {
     var connections: Int = 16
     var mode: RouteMode = .smart
     var customPrefix: String = ""
+    /// 同时进行的下载数（IDM 的下载队列）：超过就排队，前面的完成自动补位
+    var maxConcurrent: Int = 3
 
     static let `default` = AccelerationSettings()
     /// 设置页档位。
@@ -114,6 +116,9 @@ struct AccelerationSettings {
     /// 当前实际开多少条连接（服务器撑得住才往上爬，一遇限流立刻减半）。
     /// 所以设 128 不会像以前那样盲目砸 128 条连接撞限流，只会给引擎更高的天花板。
     static let connectionOptions = [8, 16, 32, 64, 128]
+    /// 同时下载数档位
+    static let concurrentOptions = [1, 2, 3, 5]
+    static let maxConcurrentLimit = 5
     /// 引擎接受的并发上限
     static let maxConnections = 128
 
@@ -121,6 +126,7 @@ struct AccelerationSettings {
         static let connections = "ab.connections"
         static let mode = "ab.routeMode"
         static let customPrefix = "ab.customPrefix"
+        static let maxConcurrent = "ab.maxConcurrent"
     }
 
     static func load() -> AccelerationSettings {
@@ -130,6 +136,8 @@ struct AccelerationSettings {
         settings.connections = stored > 0 ? stored : 16
         settings.mode = RouteMode(rawValue: store.string(forKey: Keys.mode) ?? "") ?? .smart
         settings.customPrefix = store.string(forKey: Keys.customPrefix) ?? ""
+        let concurrent = store.integer(forKey: Keys.maxConcurrent)
+        settings.maxConcurrent = concurrent > 0 ? concurrent : 3
         return settings
     }
 
@@ -138,9 +146,12 @@ struct AccelerationSettings {
         store.set(clampedConnections, forKey: Keys.connections)
         store.set(mode.rawValue, forKey: Keys.mode)
         store.set(customPrefix, forKey: Keys.customPrefix)
+        store.set(clampedMaxConcurrent, forKey: Keys.maxConcurrent)
     }
 
     var clampedConnections: Int { max(1, min(connections, Self.maxConnections)) }
+
+    var clampedMaxConcurrent: Int { max(1, min(maxConcurrent, Self.maxConcurrentLimit)) }
 
     /// 当前设置下的候选通道（直连永远保留兜底）
     ///

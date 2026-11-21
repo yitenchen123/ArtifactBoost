@@ -131,6 +131,9 @@ struct DownloadItemRow: View {
             }
             .padding(.vertical, 2)
 
+        case .queued:
+            queuedView()
+
         case .downloading(let progress):
             downloadingView(progress)
 
@@ -269,6 +272,35 @@ struct DownloadItemRow: View {
             }
             .padding(.top, 1)
         }
+    }
+
+    // MARK: - 排队中
+
+    @ViewBuilder
+    private func queuedView() -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Theme.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("排队中")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.strongText)
+                Text("前面的下载完成后自动开始")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.subtle)
+            }
+            Spacer(minLength: 0)
+            Button {
+                downloads.cancel(item)
+            } label: {
+                Text("取消")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.red)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 2)
     }
 
     // MARK: - 已暂停
