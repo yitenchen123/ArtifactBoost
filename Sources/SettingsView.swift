@@ -4,6 +4,7 @@ import UIKit
 /// 设置：账户 + 加速设置（并发）+ 下载源 + 关于
 struct SettingsView: View {
     @EnvironmentObject private var session: SessionManager
+    @EnvironmentObject private var downloads: DownloadManager
 
     @State private var settings = AccelerationSettings.load()
     // 原神彩蛋：长按导航栏「设置」标题触发，二次确认后才跳官网，不做后台静默下载
@@ -235,7 +236,12 @@ struct SettingsView: View {
 
     private var concurrentBinding: Binding<Int> {
         Binding(get: { settings.maxConcurrent },
-                set: { settings.maxConcurrent = $0; settings.save() })
+                set: {
+                    settings.maxConcurrent = $0
+                    settings.save()
+                    // 调大上限后立刻把排队中的任务补进来，不用等现有任务结束
+                    downloads.fillQueueSlots()
+                })
     }
 
     private var prefixBinding: Binding<String> {

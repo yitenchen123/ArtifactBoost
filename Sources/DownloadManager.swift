@@ -181,6 +181,17 @@ final class DownloadManager: ObservableObject {
         start(item, settings: entry.settings)
     }
 
+    /// 用户把「同时下载数」调大后，立刻把空出来的名额补满。
+    /// 否则要等某个正在下载的任务结束，队列才会动 —— 看起来像设置没生效。
+    func fillQueueSlots() {
+        let limit = AccelerationSettings.load().clampedMaxConcurrent
+        while activeCount < limit {
+            let before = activeCount
+            drainQueue()
+            if activeCount == before { return }
+        }
+    }
+
     private func removeFromQueue(_ id: String) {
         pending.removeAll { $0.id == id }
     }

@@ -805,6 +805,8 @@ final class DownloadEngine: @unchecked Sendable {
         if boot?.chunked != true || total < Self.minChunkedTotal {
             if let key = request.resumeKey { ResumeStore.shared.discard(key: key) }
             let single = try await downloadSingle(url: finalURL,
+                                                 authToken: request.authToken,
+                                                 headers: request.startHeaders,
                                                  into: outURL,
                                                  expectedTotal: total,
                                                  progress: progress)
@@ -1865,6 +1867,8 @@ final class DownloadEngine: @unchecked Sendable {
     /// 老实现用 `session.download(for:)`：拿不到任何中间进度（界面只能转圈），
     /// 而且断流时可能安静返回一个截断文件。现在换成 delegate 驱动。
     private func downloadSingle(url: URL,
+                                authToken: String?,
+                                headers: [String: String],
                                 into outURL: URL,
                                 expectedTotal: Int64,
                                 progress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> (url: URL, bytes: Int64) {
@@ -1884,6 +1888,13 @@ final class DownloadEngine: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        // 私有仓库的源码包（codeload）同样要鉴权；Token 只发给 GitHub 自己的域名
+        if let authToken, Self.isGitHubHost(url.host) {
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        }
         let task = session.downloadTask(with: request)
         inflight.register(task)
 
